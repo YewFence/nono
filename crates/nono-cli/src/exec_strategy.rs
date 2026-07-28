@@ -16,7 +16,6 @@ mod supervisor_linux;
 
 use crate::diagnostic::{DiagnosticFormatter, DiagnosticMode};
 use crate::startup_prompt::{notify_startup_termination_for_child, print_terminal_safe_stderr};
-use crate::{DETACHED_CWD_PROMPT_RESPONSE_ENV, DETACHED_LAUNCH_ENV, DETACHED_SESSION_ID_ENV};
 use nix::libc;
 use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
@@ -334,10 +333,6 @@ pub struct SupervisorConfig<'a> {
     pub approval_backend: &'a dyn ApprovalBackend,
     /// Session identifier used for audit correlation.
     pub session_id: &'a str,
-    /// Whether the launching terminal should be attached immediately.
-    pub attach_initial_client: bool,
-    /// Configured in-band PTY detach sequence.
-    pub detach_sequence: Option<&'a [u8]>,
     /// Allowed URL origins for supervisor-delegated browser opens (from profile).
     /// Empty means no URLs are allowed.
     pub open_url_origins: &'a [String],
@@ -395,12 +390,7 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
     cmd.env_clear();
     cmd.current_dir(config.current_dir);
 
-    const BLOCKED_EXTRA: &[&str] = &[
-        "NONO_CAP_FILE",
-        DETACHED_LAUNCH_ENV,
-        DETACHED_SESSION_ID_ENV,
-        DETACHED_CWD_PROMPT_RESPONSE_ENV,
-    ];
+    const BLOCKED_EXTRA: &[&str] = &["NONO_CAP_FILE"];
 
     // `host_pwd` was resolved pre-sandbox; only the syscall-free policy gate is left
     // to apply here, over this strategy's own filters.
@@ -556,8 +546,8 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
 
     // Create supervisor socket pair only when the exec'd child actually needs
     // to talk back to the unsandboxed parent. The supervised parent/session
-    // model still works without this socket: attach/detach uses the PTY proxy
-    // and diagnostics come from the parent wait path. On Linux, avoiding a raw
+    // model still works without this socket: diagnostics come from the parent
+    // wait path. On Linux, avoiding a raw
     // inherited supervisor socket for the common "plain supervised run" path
     // improves compatibility with CLIs that abort on unexpected inherited fds.
     #[cfg(target_os = "linux")]
@@ -585,13 +575,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let mut browser_shim: Option<BrowserShim> = None;
 
-    const BLOCKED_EXTRA: &[&str] = &[
-        "NONO_CAP_FILE",
-        "NONO_SUPERVISOR_PATH",
-        DETACHED_LAUNCH_ENV,
-        DETACHED_SESSION_ID_ENV,
-        DETACHED_CWD_PROMPT_RESPONSE_ENV,
-    ];
+    const BLOCKED_EXTRA: &[&str] = &["NONO_CAP_FILE", "NONO_SUPERVISOR_PATH"];
 
     let child_pwd = config.child_pwd.filter(|_| {
         env_sanitization::pwd_rewrite_permitted(
@@ -848,8 +832,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
         }
     }
 
-    // PTY pair is prepared by the caller so sessions can be detached and
-    // reattached independently of capability elevation.
+    // The caller prepares the PTY pair before capability elevation setup.
     let pty_slave_fd = pty_pair.as_ref().map(|p| p.slave.as_raw_fd());
 
     // Compute child's FD keep list: PTY slave (if elevation) + supervisor socket fd
@@ -1342,18 +1325,10 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
 
             let mut pty_proxy = if let Some(pty) = pty_pair {
                 drop(pty.slave);
-                let session_id = pty_session_id
+                let _session_id = pty_session_id
                     .or_else(|| supervisor.map(|s| s.session_id))
                     .unwrap_or("unknown");
-                let attach_initial_client =
-                    supervisor.map(|s| s.attach_initial_client).unwrap_or(true);
-                let detach_sequence = supervisor.and_then(|s| s.detach_sequence);
-                match crate::pty_proxy::PtyProxy::new(
-                    pty.master,
-                    session_id,
-                    attach_initial_client,
-                    detach_sequence,
-                ) {
+                match crate::pty_proxy::PtyProxy::new(pty.master) {
                     Ok(proxy) => Some(proxy),
                     Err(e) => {
                         let _ = signal::kill(child, Signal::SIGKILL);
@@ -1605,15 +1580,8 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     (status, Vec::new(), Vec::new(), Vec::new())
                 };
 
-            // Close the attach listener immediately so no new attach
-            // connections can sneak in during teardown.  Without this,
-            // the kernel keeps accepting connections into the listen
-            // backlog even though nobody is calling accept(), and the
-            // attaching client gets EPIPE ("Broken pipe") when it
-            // tries to send the handshake.
             if let Some(ref mut p) = pty_proxy {
                 p.drain_master_output(timeouts::pty_drain_timeout());
-                p.shutdown_attach_listener();
                 p.release_terminal_for_prompt();
             }
 
@@ -2075,7 +2043,7 @@ fn wait_for_child_with_pty(
     let startup_deadline = startup_timeout.map(|cfg| (Instant::now() + cfg.timeout, cfg));
 
     loop {
-        let (master_fd, client_fd, attach_fd, resize_fd) = pty.poll_fds();
+        let (master_fd, client_fd) = pty.poll_fds();
         let mut pfds = [
             libc::pollfd {
                 fd: master_fd,
@@ -2087,29 +2055,12 @@ fn wait_for_child_with_pty(
                 events: libc::POLLIN,
                 revents: 0,
             },
-            libc::pollfd {
-                fd: attach_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: resize_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
         ];
 
-        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 4, 200) };
+        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 2, 200) };
 
         if ret > 0 {
-            if !handle_pty_poll_events(
-                pty,
-                pfds[0].revents,
-                pfds[1].revents,
-                pfds[2].revents,
-                pfds[3].revents,
-                "PTY wait loop",
-            ) {
+            if !handle_pty_poll_events(pty, pfds[0].revents, pfds[1].revents, "PTY wait loop") {
                 break;
             }
         } else if ret < 0 {
@@ -2120,12 +2071,6 @@ fn wait_for_child_with_pty(
             }
         }
 
-        let pause_requested = drain_pause_pipe();
-        if pause_requested {
-            pty.sync_current_terminal_winsize();
-        }
-        let in_band_detach_requested = pty.take_detach_request();
-        handle_pty_detach_request(Some(pty), pause_requested, in_band_detach_requested);
         handle_pty_suspension(Some(pty), child);
 
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
@@ -2227,8 +2172,6 @@ fn setup_signal_forwarding(child: Pid, pty_master_fd: Option<i32>) {
         pty_master_fd.unwrap_or(-1),
         std::sync::atomic::Ordering::SeqCst,
     );
-    create_pause_pipe();
-
     // Install signal handlers for common signals
     // SAFETY: signal handlers are async-signal-safe (only call kill())
     unsafe {
@@ -2237,7 +2180,6 @@ fn setup_signal_forwarding(child: Pid, pty_master_fd: Option<i32>) {
             Signal::SIGTERM,
             Signal::SIGHUP,
             Signal::SIGQUIT,
-            Signal::SIGUSR1,
         ] {
             if let Err(e) = signal::signal(*sig, signal::SigHandler::Handler(forward_signal)) {
                 debug!("Failed to install handler for {:?}: {}", sig, e);
@@ -2257,47 +2199,6 @@ fn setup_signal_forwarding(child: Pid, pty_master_fd: Option<i32>) {
 
 static CHILD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 static PTY_MASTER_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-static PAUSE_PIPE_WRITE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-static PAUSE_PIPE_READ: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-
-fn create_pause_pipe() -> i32 {
-    let mut fds = [0i32; 2];
-    let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
-    if ret != 0 {
-        return -1;
-    }
-    unsafe {
-        libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK);
-        libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK);
-        libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
-        libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
-    }
-    PAUSE_PIPE_READ.store(fds[0], std::sync::atomic::Ordering::SeqCst);
-    PAUSE_PIPE_WRITE.store(fds[1], std::sync::atomic::Ordering::SeqCst);
-    fds[0]
-}
-
-fn drain_pause_pipe() -> bool {
-    let read_fd = PAUSE_PIPE_READ.load(std::sync::atomic::Ordering::SeqCst);
-    if read_fd < 0 {
-        return false;
-    }
-    let mut buf = [0u8; 16];
-    let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
-    n > 0
-}
-
-fn close_pause_pipe() {
-    let r = PAUSE_PIPE_READ.swap(-1, std::sync::atomic::Ordering::SeqCst);
-    let w = PAUSE_PIPE_WRITE.swap(-1, std::sync::atomic::Ordering::SeqCst);
-    if r >= 0 {
-        unsafe { libc::close(r) };
-    }
-    if w >= 0 {
-        unsafe { libc::close(w) };
-    }
-}
-
 extern "C" fn forward_signal(sig: libc::c_int) {
     let child_raw = CHILD_PID.load(std::sync::atomic::Ordering::SeqCst);
     if child_raw > 0 {
@@ -2309,13 +2210,6 @@ extern "C" fn forward_signal(sig: libc::c_int) {
                     if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 {
                         libc::ioctl(master_fd, libc::TIOCSWINSZ, &ws);
                     }
-                }
-            }
-        } else if sig == libc::SIGUSR1 {
-            let wfd = PAUSE_PIPE_WRITE.load(std::sync::atomic::Ordering::SeqCst);
-            if wfd >= 0 {
-                unsafe {
-                    libc::write(wfd, b"P".as_ptr().cast(), 1);
                 }
             }
         } else {
@@ -2330,9 +2224,8 @@ extern "C" fn forward_signal(sig: libc::c_int) {
         // No child to forward to (e.g. during the post-exit profile-save prompt).
         // For termination signals, restore the default handler and re-raise so
         // the signal takes its default action (terminating nono) rather than
-        // being swallowed. Non-termination signals (SIGWINCH, SIGUSR1) are
-        // ignored here — their forwarding targets (PTY master, pause pipe) are
-        // already torn down.
+        // being swallowed. SIGWINCH is ignored here because its PTY forwarding
+        // target is already torn down.
         unsafe {
             libc::signal(sig, libc::SIG_DFL);
             libc::raise(sig);
@@ -2343,24 +2236,12 @@ extern "C" fn forward_signal(sig: libc::c_int) {
 fn clear_signal_forwarding_target() {
     CHILD_PID.store(0, std::sync::atomic::Ordering::SeqCst);
     PTY_MASTER_FD.store(-1, std::sync::atomic::Ordering::SeqCst);
-    close_pause_pipe();
-}
-
-fn detach_client_for_session(pty: &mut crate::pty_proxy::PtyProxy) -> bool {
-    pty.detach()
-}
-
-fn restore_terminal_after_detach(in_alt_screen: bool) {
-    crate::pty_proxy::write_detach_terminal_reset(libc::STDOUT_FILENO, in_alt_screen);
-    crate::pty_proxy::write_detach_notice(libc::STDERR_FILENO);
 }
 
 fn handle_pty_poll_events(
     pty: &mut crate::pty_proxy::PtyProxy,
     master_revents: libc::c_short,
     client_revents: libc::c_short,
-    attach_revents: libc::c_short,
-    resize_revents: libc::c_short,
     loop_name: &str,
 ) -> bool {
     if master_revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
@@ -2373,34 +2254,7 @@ fn handle_pty_poll_events(
         debug!("Stopping {loop_name} after PTY client relay failure");
         return false;
     }
-    if attach_revents & libc::POLLIN != 0 {
-        pty.try_accept();
-    }
-    if resize_revents & libc::POLLIN != 0 {
-        pty.apply_resize_update();
-    }
     true
-}
-
-fn handle_pty_detach_request(
-    pty: Option<&mut crate::pty_proxy::PtyProxy>,
-    pause_requested: bool,
-    in_band_detach_requested: bool,
-) {
-    if pause_requested {
-        info!("PTY detach requested via SIGUSR1 control signal");
-    }
-    if in_band_detach_requested {
-        info!("PTY detach requested via in-band key sequence");
-    }
-    if let Some(p) = pty
-        && (pause_requested || in_band_detach_requested)
-    {
-        let in_alt_screen = p.in_alt_screen();
-        if detach_client_for_session(p) {
-            restore_terminal_after_detach(in_alt_screen);
-        }
-    }
 }
 
 /// Send `sig` to the PTY's foreground process group, falling back to `child`.
@@ -2476,8 +2330,8 @@ fn handle_pty_suspension(pty: Option<&mut crate::pty_proxy::PtyProxy>, child: Pi
         }
     }
 
-    // Save raw settings for restore-on-resume, and preserve the
-    // cooked settings for later detach (restore_terminal consumes them).
+    // Save raw settings for restore-on-resume and preserve the cooked settings
+    // consumed by restore_terminal().
     let raw_termios = nix::sys::termios::tcgetattr(std::io::stdin()).ok();
     let cooked_termios = pty.saved_termios.clone();
 
@@ -2503,7 +2357,7 @@ fn handle_pty_suspension(pty: Option<&mut crate::pty_proxy::PtyProxy>, child: Pi
             &termios,
         );
     }
-    // Restore cooked settings so detach works correctly later.
+    // Restore the cooked settings for the next suspension or final teardown.
     pty.saved_termios = cooked_termios;
 
     // Re-enter the alternate screen the child was using before resuming it.
@@ -2623,8 +2477,7 @@ fn run_supervisor_loop(
     let startup_deadline = startup_timeout.map(|cfg| (Instant::now() + cfg.timeout, cfg));
 
     loop {
-        let (pty_master, pty_client, pty_attach, pty_resize) =
-            pty.as_ref().map_or((-1, -1, -1, -1), |p| p.poll_fds());
+        let (pty_master, pty_client) = pty.as_ref().map_or((-1, -1), |p| p.poll_fds());
         let mut pfds = [
             libc::pollfd {
                 fd: sock_fd,
@@ -2642,23 +2495,13 @@ fn run_supervisor_loop(
                 revents: 0,
             },
             libc::pollfd {
-                fd: pty_attach,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: pty_resize,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
                 fd: listener_fd,
                 events: libc::POLLIN,
                 revents: 0,
             },
         ];
 
-        let nfds: libc::nfds_t = if listener_fd >= 0 { 6 } else { 5 };
+        let nfds: libc::nfds_t = if listener_fd >= 0 { 4 } else { 3 };
         let ret = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, 200) };
 
         if ret > 0 {
@@ -2694,21 +2537,14 @@ fn run_supervisor_loop(
 
             // Handle URL open connections via named socket listener
             if listener_fd >= 0
-                && pfds[5].revents & libc::POLLIN != 0
+                && pfds[3].revents & libc::POLLIN != 0
                 && let Some(listener) = url_listener
             {
                 handle_url_listener_connection(listener, config, &mut denials.url);
             }
 
             if let Some(ref mut p) = pty
-                && !handle_pty_poll_events(
-                    p,
-                    pfds[1].revents,
-                    pfds[2].revents,
-                    pfds[3].revents,
-                    pfds[4].revents,
-                    "supervisor loop",
-                )
+                && !handle_pty_poll_events(p, pfds[1].revents, pfds[2].revents, "supervisor loop")
             {
                 break;
             }
@@ -2720,18 +2556,6 @@ fn run_supervisor_loop(
             }
         }
 
-        let pause_requested = drain_pause_pipe();
-        if let Some(ref mut p) = pty
-            && pause_requested
-        {
-            p.sync_current_terminal_winsize();
-        }
-        let in_band_detach_requested = pty.as_mut().is_some_and(|p| p.take_detach_request());
-        handle_pty_detach_request(
-            pty.as_deref_mut(),
-            pause_requested,
-            in_band_detach_requested,
-        );
         handle_pty_suspension(pty.as_deref_mut(), child);
 
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
@@ -2947,8 +2771,7 @@ fn run_supervisor_loop(
             idx
         });
         let pty_base_idx = pfds.len();
-        let (pty_master, pty_client, pty_attach, pty_resize) =
-            pty.as_ref().map_or((-1, -1, -1, -1), |p| p.poll_fds());
+        let (pty_master, pty_client) = pty.as_ref().map_or((-1, -1), |p| p.poll_fds());
         pfds.push(libc::pollfd {
             fd: pty_master,
             events: libc::POLLIN,
@@ -2956,16 +2779,6 @@ fn run_supervisor_loop(
         });
         pfds.push(libc::pollfd {
             fd: pty_client,
-            events: libc::POLLIN,
-            revents: 0,
-        });
-        pfds.push(libc::pollfd {
-            fd: pty_attach,
-            events: libc::POLLIN,
-            revents: 0,
-        });
-        pfds.push(libc::pollfd {
-            fd: pty_resize,
             events: libc::POLLIN,
             revents: 0,
         });
@@ -3092,8 +2905,6 @@ fn run_supervisor_loop(
                         p,
                         pfds[pty_base_idx].revents,
                         pfds[pty_base_idx + 1].revents,
-                        pfds[pty_base_idx + 2].revents,
-                        pfds[pty_base_idx + 3].revents,
                         "supervisor loop",
                     )
                 {
@@ -3110,18 +2921,6 @@ fn run_supervisor_loop(
             std::cmp::Ordering::Equal => {}
         }
 
-        let pause_requested = drain_pause_pipe();
-        if let Some(ref mut p) = pty
-            && pause_requested
-        {
-            p.sync_current_terminal_winsize();
-        }
-        let in_band_detach_requested = pty.as_mut().is_some_and(|p| p.take_detach_request());
-        handle_pty_detach_request(
-            pty.as_deref_mut(),
-            pause_requested,
-            in_band_detach_requested,
-        );
         handle_pty_suspension(pty.as_deref_mut(), child);
 
         // Drain reparented orphans; if the primary child was among them,
@@ -3243,11 +3042,11 @@ struct SupervisorDenials {
 
 /// Run an approval request with the PTY relay paused.
 ///
-/// While a terminal client is attached to the PTY relay, the real terminal is
+/// While the foreground terminal is connected to the PTY relay, it is
 /// in raw mode and relaying keystrokes to the child, so an interactive prompt
 /// would render garbled and never see the user's answer. Pause the relay
 /// (restoring cooked mode) for the duration of the request and re-enter relay
-/// mode afterwards. A no-op when no terminal-backed client is attached.
+/// mode afterwards. A no-op after the terminal has been released.
 fn request_approval_with_relay_paused(
     config: &SupervisorConfig<'_>,
     request: &nono::supervisor::ApprovalRequest,
@@ -5191,8 +4990,6 @@ mod tests {
             protected_roots: &[],
             approval_backend: &backend,
             session_id: "test-session",
-            attach_initial_client: false,
-            detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5318,8 +5115,6 @@ mod tests {
             protected_roots: &[],
             approval_backend: &backend,
             session_id: "test-proxy-v4",
-            attach_initial_client: false,
-            detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5411,8 +5206,6 @@ mod tests {
             protected_roots: &[],
             approval_backend: &backend,
             session_id: "test",
-            attach_initial_client: false,
-            detach_sequence: None,
             open_url_origins: &origins,
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5457,8 +5250,6 @@ mod tests {
             protected_roots: &[],
             approval_backend: &backend,
             session_id: "test",
-            attach_initial_client: false,
-            detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5510,8 +5301,6 @@ mod tests {
             protected_roots: &[],
             approval_backend: &backend,
             session_id: "test",
-            attach_initial_client: false,
-            detach_sequence: None,
             open_url_origins: &origins,
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5579,8 +5368,6 @@ mod tests {
             protected_roots: &[],
             approval_backend: &backend,
             session_id: "test",
-            attach_initial_client: false,
-            detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: true,
             audit_recorder: None,
@@ -5609,8 +5396,6 @@ mod tests {
             protected_roots: &[],
             approval_backend: &backend,
             session_id: "test",
-            attach_initial_client: false,
-            detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5658,8 +5443,6 @@ mod tests {
             protected_roots: &[],
             approval_backend: &backend,
             session_id: "test",
-            attach_initial_client: false,
-            detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5812,8 +5595,6 @@ mod tests {
             protected_roots: &[],
             approval_backend: &backend,
             session_id: "test",
-            attach_initial_client: false,
-            detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5870,8 +5651,6 @@ mod tests {
             protected_roots: &[],
             approval_backend: &backend,
             session_id: "test",
-            attach_initial_client: false,
-            detach_sequence: None,
             open_url_origins: &origins,
             open_url_allow_localhost: false,
             audit_recorder: None,
@@ -5917,8 +5696,6 @@ mod tests {
             protected_roots: &[],
             approval_backend: &backend,
             session_id: "test",
-            attach_initial_client: false,
-            detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: true,
             audit_recorder: None,
@@ -5983,8 +5760,6 @@ mod tests {
             protected_roots: &[],
             approval_backend: &backend,
             session_id: "test",
-            attach_initial_client: false,
-            detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
             audit_recorder: None,

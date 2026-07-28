@@ -234,8 +234,6 @@ fn cli_verbosity(cli: &Cli) -> u8 {
         | Commands::List(_)
         | Commands::Ps(_)
         | Commands::Stop(_)
-        | Commands::Detach(_)
-        | Commands::Attach(_)
         | Commands::Logs(_)
         | Commands::Inspect(_)
         | Commands::Session(_)

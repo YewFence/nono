@@ -2,9 +2,8 @@ use crate::cli::{RunArgs, SandboxArgs, ShellArgs, WrapArgs};
 use crate::exec_strategy;
 use crate::execution_runtime::execute_sandboxed;
 use crate::launch_runtime::{
-    ExecutionFlags, LaunchPlan, SessionLaunchOptions, load_configured_detach_sequence,
-    load_configured_redaction_policy, prepare_run_launch_plan, resolve_requested_workdir,
-    select_exec_strategy,
+    ExecutionFlags, LaunchPlan, SessionLaunchOptions, load_configured_redaction_policy,
+    prepare_run_launch_plan, resolve_requested_workdir, select_exec_strategy,
 };
 use crate::output;
 use crate::profile;
@@ -269,17 +268,13 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
         eprintln!();
     }
 
-    let session_id = std::env::var(crate::DETACHED_SESSION_ID_ENV)
-        .ok()
-        .filter(|id| !id.is_empty())
-        .unwrap_or_else(crate::session::generate_session_id);
+    let session_id = crate::session::generate_session_id();
     let network =
         prepare_proxy_launch_options(&args.sandbox, &prepared, silent, session_id.clone())?;
     let strategy = select_exec_strategy(
         false,
         network.is_proxy_active(),
         prepared.capability_elevation,
-        false,
         false,
     );
 
@@ -293,7 +288,6 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
         session: SessionLaunchOptions {
             session_id: Some(session_id),
             session_name: args.name,
-            detach_sequence: load_configured_detach_sequence()?,
             ..SessionLaunchOptions::default()
         },
         ..ExecutionFlags::from_prepared(&prepared, silent)?

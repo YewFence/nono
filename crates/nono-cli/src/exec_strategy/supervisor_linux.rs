@@ -1664,8 +1664,6 @@ mod tests {
                 protected_roots: &[],
                 approval_backend: backend,
                 session_id: "test-net-decision",
-                attach_initial_client: false,
-                detach_sequence: None,
                 open_url_origins: &[],
                 open_url_allow_localhost: false,
                 audit_recorder: None,

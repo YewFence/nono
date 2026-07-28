@@ -73,7 +73,6 @@ mod session;
 mod session_commands;
 mod setup;
 mod startup_prompt;
-mod startup_runtime;
 mod state_paths;
 mod supervised_runtime;
 mod terminal_approval;
@@ -104,10 +103,6 @@ use command_blocking_deprecation::{
     collect_cli_warnings, print_warnings as print_deprecation_warnings,
 };
 use nono::Result;
-
-const DETACHED_LAUNCH_ENV: &str = "NONO_DETACHED_LAUNCH";
-const DETACHED_CWD_PROMPT_RESPONSE_ENV: &str = "NONO_DETACHED_CWD_PROMPT_RESPONSE";
-const DETACHED_SESSION_ID_ENV: &str = "NONO_DETACHED_SESSION_ID";
 
 pub(crate) use launch_runtime::rollback_base_exclusions;
 
@@ -156,6 +151,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_runtime::allows_pre_exec_update_check;
     use crate::cli::SandboxArgs;
     use crate::execution_runtime::execution_start_dir;
     use crate::launch_runtime::{
@@ -169,7 +165,6 @@ mod tests {
     use crate::sandbox_prepare::maybe_enable_macos_gpu;
     #[cfg(target_os = "macos")]
     use crate::sandbox_prepare::maybe_enable_macos_launch_services;
-    use crate::startup_runtime::allows_pre_exec_update_check;
     use nono::{AccessMode, CapabilitySet, FsCapability};
 
     fn sandbox_args() -> SandboxArgs {
@@ -439,7 +434,7 @@ mod tests {
     #[test]
     fn test_select_exec_strategy_uses_supervised_for_plain_run() {
         assert_eq!(
-            select_exec_strategy(false, false, false, false, false),
+            select_exec_strategy(false, false, false, false),
             exec_strategy::ExecStrategy::Supervised
         );
     }
@@ -447,7 +442,7 @@ mod tests {
     #[test]
     fn test_select_exec_strategy_uses_supervised_for_rollback() {
         assert_eq!(
-            select_exec_strategy(true, false, false, false, false),
+            select_exec_strategy(true, false, false, false),
             exec_strategy::ExecStrategy::Supervised
         );
     }
@@ -455,7 +450,7 @@ mod tests {
     #[test]
     fn test_select_exec_strategy_uses_supervised_for_proxy() {
         assert_eq!(
-            select_exec_strategy(false, true, false, false, false),
+            select_exec_strategy(false, true, false, false),
             exec_strategy::ExecStrategy::Supervised
         );
     }
@@ -463,7 +458,7 @@ mod tests {
     #[test]
     fn test_select_exec_strategy_uses_supervised_for_capability_elevation() {
         assert_eq!(
-            select_exec_strategy(false, false, true, false, false),
+            select_exec_strategy(false, false, true, false),
             exec_strategy::ExecStrategy::Supervised
         );
     }
@@ -471,15 +466,7 @@ mod tests {
     #[test]
     fn test_select_exec_strategy_uses_supervised_for_trust_interception() {
         assert_eq!(
-            select_exec_strategy(false, false, false, true, false),
-            exec_strategy::ExecStrategy::Supervised
-        );
-    }
-
-    #[test]
-    fn test_select_exec_strategy_uses_supervised_for_detached_start() {
-        assert_eq!(
-            select_exec_strategy(false, false, false, false, true),
+            select_exec_strategy(false, false, false, true),
             exec_strategy::ExecStrategy::Supervised
         );
     }

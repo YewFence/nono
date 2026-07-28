@@ -1,11 +1,10 @@
 //! Session management command implementations.
 //!
-//! Handles `nono ps`, `nono stop`, `nono detach`, `nono attach`, `nono logs`,
-//! `nono inspect`, and `nono prune`.
+//! Handles `nono ps`, `nono stop`, `nono logs`, `nono inspect`, and `nono prune`.
 
-use crate::cli::{AttachArgs, DetachArgs, InspectArgs, LogsArgs, PruneArgs, PsArgs, StopArgs};
+use crate::cli::{InspectArgs, LogsArgs, PruneArgs, PsArgs, StopArgs};
 use crate::command_display::{format_command_line, truncate_chars};
-use crate::session::{self, SessionAttachment, SessionRecord, SessionStatus};
+use crate::session::{self, SessionRecord, SessionStatus};
 use colored::Colorize;
 use nix::libc;
 use nono::{NonoError, Result};
@@ -33,7 +32,7 @@ fn reject_if_sandboxed(command: &str) -> Result<()> {
 pub fn run_ps(args: &PsArgs) -> Result<()> {
     let sessions = session::list_sessions()?;
 
-    // Filter: by default show live sessions, whether attached or detached.
+    // Filter: by default show live sessions.
     let filtered: Vec<&SessionRecord> = sessions
         .iter()
         .filter(|s| args.all || s.status != SessionStatus::Exited)
@@ -50,7 +49,7 @@ pub fn run_ps(args: &PsArgs) -> Result<()> {
         if args.all {
             eprintln!("No sessions found.");
         } else {
-            eprintln!("No running or detached sessions. Use --all to include exited sessions.");
+            eprintln!("No running sessions. Use --all to include exited sessions.");
         }
         return Ok(());
     }
@@ -60,14 +59,12 @@ pub fn run_ps(args: &PsArgs) -> Result<()> {
         session_id: String,
         name: String,
         status_text: String,
-        attach_text: String,
         pid: String,
         uptime: String,
         profile: String,
         command: String,
         // originals needed for colour decisions
         status: SessionStatus,
-        attachment: SessionAttachment,
         exit_code: i32,
     }
 
@@ -80,24 +77,15 @@ pub fn run_ps(args: &PsArgs) -> Result<()> {
                 SessionStatus::Paused => "paused".to_string(),
                 SessionStatus::Exited => format!("exited({exit_code})"),
             };
-            let attach_text = match s.status {
-                SessionStatus::Exited => "-".to_string(),
-                _ => match s.attachment {
-                    SessionAttachment::Attached => "attached".to_string(),
-                    SessionAttachment::Detached => "detached".to_string(),
-                },
-            };
             PsRow {
                 session_id: s.session_id.clone(),
                 name: s.name.as_deref().unwrap_or("-").to_string(),
                 status_text,
-                attach_text,
                 pid: s.child_pid.to_string(),
                 uptime: format_uptime(&s.started),
                 profile: s.profile.as_deref().unwrap_or("-").to_string(),
                 command: format_command_line(&s.command),
                 status: s.status.clone(),
-                attachment: s.attachment.clone(),
                 exit_code,
             }
         })
@@ -107,7 +95,6 @@ pub fn run_ps(args: &PsArgs) -> Result<()> {
     let mut session_w = "SESSION".len();
     let mut name_w = "NAME".len();
     let mut status_w = "STATUS".len();
-    let mut attach_w = "ATTACH".len();
     let mut pid_w = "PID".len();
     let mut uptime_w = "UPTIME".len();
     let mut profile_w = "PROFILE".len();
@@ -116,7 +103,6 @@ pub fn run_ps(args: &PsArgs) -> Result<()> {
         session_w = session_w.max(row.session_id.len());
         name_w = name_w.max(row.name.len());
         status_w = status_w.max(row.status_text.len());
-        attach_w = attach_w.max(row.attach_text.len());
         pid_w = pid_w.max(row.pid.len());
         uptime_w = uptime_w.max(row.uptime.len());
         profile_w = profile_w.max(row.profile.len());
@@ -128,29 +114,16 @@ pub fn run_ps(args: &PsArgs) -> Result<()> {
     // Reserve space for the COMMAND column based on terminal width.
     let term_cols = terminal_columns().unwrap_or(120);
     // 7 separating spaces + "COMMAND" header (minimum 7 visible chars)
-    let fixed_w = session_w
-        + 1
-        + name_w
-        + 1
-        + status_w
-        + 1
-        + attach_w
-        + 1
-        + pid_w
-        + 1
-        + uptime_w
-        + 1
-        + profile_w
-        + 1;
+    let fixed_w =
+        session_w + 1 + name_w + 1 + status_w + 1 + pid_w + 1 + uptime_w + 1 + profile_w + 1;
     let cmd_w = term_cols.saturating_sub(fixed_w).max(7);
 
     // Header
     println!(
-        "{} {} {} {} {} {} {} COMMAND",
+        "{} {} {} {} {} {} COMMAND",
         pad_right("SESSION", session_w),
         pad_right("NAME", name_w),
         pad_right("STATUS", status_w),
-        pad_right("ATTACH", attach_w),
         pad_right("PID", pid_w),
         pad_right("UPTIME", uptime_w),
         pad_right("PROFILE", profile_w),
@@ -161,7 +134,7 @@ pub fn run_ps(args: &PsArgs) -> Result<()> {
         let profile_cell = pad_right(&truncate_chars(&row.profile, profile_w), profile_w);
         let cmd_cell = truncate_chars(&row.command, cmd_w);
 
-        // Pad status/attach to their column width *before* applying colour so
+        // Pad status to its column width before applying colour so
         // ANSI escape bytes don't upset the visible alignment.
         let status_padded = pad_right(&row.status_text, status_w);
         let status_colored = match row.status {
@@ -171,19 +144,11 @@ pub fn run_ps(args: &PsArgs) -> Result<()> {
             _ => status_padded,
         };
 
-        let attach_padded = pad_right(&row.attach_text, attach_w);
-        let attach_colored = match (&row.status, &row.attachment) {
-            (SessionStatus::Exited, _) => attach_padded,
-            (_, SessionAttachment::Attached) => attach_padded.green().to_string(),
-            (_, SessionAttachment::Detached) => attach_padded.yellow().to_string(),
-        };
-
         println!(
-            "{} {} {} {} {} {} {} {}",
+            "{} {} {} {} {} {} {}",
             pad_right(&row.session_id, session_w),
             name_cell,
             status_colored,
-            attach_colored,
             pad_right(&row.pid, pid_w),
             pad_right(&row.uptime, uptime_w),
             profile_cell,
@@ -284,91 +249,6 @@ pub fn run_stop(args: &StopArgs) -> Result<()> {
     Ok(())
 }
 
-/// Dispatch `nono detach`.
-pub fn run_detach(args: &DetachArgs) -> Result<()> {
-    reject_if_sandboxed("detach")?;
-    let record = session::load_session(&args.session)?;
-
-    if record.attachment == SessionAttachment::Detached {
-        eprintln!("Session {} is already detached.", record.session_id);
-        return Ok(());
-    }
-
-    if record.status != SessionStatus::Running {
-        return Err(NonoError::ConfigParse(format!(
-            "Session {} is not running (status: {:?})",
-            record.session_id, record.status
-        )));
-    }
-
-    if !session::is_process_alive(record.supervisor_pid, record.started_epoch) {
-        return Err(NonoError::ConfigParse(format!(
-            "Session {} supervisor (PID {}) is no longer running",
-            record.session_id, record.supervisor_pid
-        )));
-    }
-
-    crate::pty_proxy::request_session_detach(&record.session_id)?;
-
-    eprintln!("Detached session {}.", record.session_id);
-    Ok(())
-}
-
-/// Dispatch `nono attach`.
-pub fn run_attach(args: &AttachArgs) -> Result<()> {
-    reject_if_sandboxed("attach")?;
-    let record = session::load_session(&args.session)?;
-
-    if record.status == SessionStatus::Exited {
-        match record.exit_code {
-            Some(code) => {
-                eprintln!(
-                    "[nono] Session {} has already exited (exit code {}).",
-                    record.session_id, code
-                );
-            }
-            None => {
-                eprintln!("[nono] Session {} has already exited.", record.session_id);
-            }
-        }
-        return Ok(());
-    }
-
-    if !session::is_process_alive(record.supervisor_pid, record.started_epoch) {
-        return Err(NonoError::ConfigParse(format!(
-            "Session {} supervisor (PID {}) is no longer running",
-            record.session_id, record.supervisor_pid
-        )));
-    }
-
-    eprintln!("[nono] Attaching to session {}...", record.session_id);
-
-    if record.status == SessionStatus::Paused {
-        return Err(NonoError::ConfigParse(format!(
-            "Session {} is paused/stopped and cannot accept attach",
-            record.session_id
-        )));
-    }
-
-    match crate::pty_proxy::attach_to_session(&record.session_id) {
-        Err(NonoError::AttachBusy) => {
-            eprintln!(
-                "[nono] Session {} already has an active attached client.",
-                record.session_id
-            );
-            Ok(())
-        }
-        Err(NonoError::SessionGone) => {
-            eprintln!(
-                "[nono] Session {} exited before attach could complete.",
-                record.session_id
-            );
-            Ok(())
-        }
-        other => other,
-    }
-}
-
 /// Dispatch `nono logs` — placeholder for Step 3.
 pub fn run_logs(args: &LogsArgs) -> Result<()> {
     let record = session::load_session(&args.session)?;
@@ -403,7 +283,6 @@ pub fn run_inspect(args: &InspectArgs) -> Result<()> {
         println!("Name:       {}", name);
     }
     println!("Status:     {:?}", record.status);
-    println!("Attached:   {:?}", record.attachment);
     println!(
         "PID:        {} (supervisor: {})",
         record.child_pid, record.supervisor_pid

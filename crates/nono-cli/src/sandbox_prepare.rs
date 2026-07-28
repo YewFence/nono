@@ -10,8 +10,7 @@ use crate::output;
 use crate::package_status::profile_selects_claude_code;
 use crate::profile;
 use crate::profile::WorkdirAccess;
-use crate::profile_runtime::{prepare_profile, prepare_profile_for_preflight};
-use crate::{DETACHED_CWD_PROMPT_RESPONSE_ENV, DETACHED_LAUNCH_ENV};
+use crate::profile_runtime::prepare_profile;
 use crate::{policy, protected_paths, sandbox_state};
 use colored::Colorize;
 use nono::{AccessMode, CapabilitySet, FsCapability, NonoError, Result, Sandbox};
@@ -370,29 +369,6 @@ pub(crate) fn should_auto_enable_claude_launch_services(
     false
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DetachedCwdPromptResponse {
-    Allow,
-    Deny,
-}
-
-impl DetachedCwdPromptResponse {
-    pub(crate) const fn as_env_value(self) -> &'static str {
-        match self {
-            Self::Allow => "allow",
-            Self::Deny => "deny",
-        }
-    }
-
-    fn from_env_value(value: &str) -> Option<Self> {
-        match value {
-            "allow" => Some(Self::Allow),
-            "deny" => Some(Self::Deny),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingCwdAccessRequest {
     cwd_canonical: PathBuf,
@@ -537,49 +513,6 @@ fn pending_cwd_access_request(
             access,
         }))
     }
-}
-
-fn detached_cwd_prompt_response() -> Option<DetachedCwdPromptResponse> {
-    std::env::var(DETACHED_CWD_PROMPT_RESPONSE_ENV)
-        .ok()
-        .as_deref()
-        .and_then(DetachedCwdPromptResponse::from_env_value)
-}
-
-pub(crate) fn resolve_detached_cwd_prompt_response(
-    args: &SandboxArgs,
-    silent: bool,
-) -> Result<Option<DetachedCwdPromptResponse>> {
-    if silent || args.allow_cwd || args.config.is_some() {
-        return Ok(None);
-    }
-
-    let workdir = resolved_workdir(args);
-    let crate::profile_runtime::PreparedProfile {
-        loaded_profile,
-        workdir_access: profile_workdir_access,
-        ..
-    } = prepare_profile_for_preflight(args, &workdir)?;
-
-    let prepared = if let Some(ref profile) = loaded_profile {
-        CapabilitySet::from_profile(profile, &workdir, args)?
-    } else {
-        CapabilitySet::from_args(args)?
-    };
-    let caps = prepared.caps;
-
-    let Some(request) =
-        pending_cwd_access_request(&caps, &workdir, profile_workdir_access.as_ref())?
-    else {
-        return Ok(None);
-    };
-
-    let confirmed = output::prompt_cwd_sharing(&request.cwd_canonical, &request.access)?;
-    Ok(Some(if confirmed {
-        DetachedCwdPromptResponse::Allow
-    } else {
-        DetachedCwdPromptResponse::Deny
-    }))
 }
 
 fn finalize_prepared_sandbox(
@@ -976,14 +909,6 @@ pub(crate) fn print_allow_launch_services_warning(silent: bool) {
     eprintln!("  Prefer using it from a trusted directory, not inside an untrusted project.");
 }
 
-fn missing_cwd_prompt_must_fail(
-    silent: bool,
-    detached_launch: bool,
-    detached_prompt_response: Option<DetachedCwdPromptResponse>,
-) -> bool {
-    silent || (detached_launch && detached_prompt_response.is_none())
-}
-
 /// Grant the procfs paths that the NVIDIA driver needs for CUDA initialisation.
 ///
 /// Scoped narrowly to the NVIDIA stack — not called on pure DRM render-node,
@@ -1258,8 +1183,6 @@ fn register_path_metadata_dirs(caps: &mut CapabilitySet) {
 
 pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<PreparedSandbox> {
     sandbox_state::cleanup_stale_state_files();
-    let detached_launch = std::env::var_os(DETACHED_LAUNCH_ENV).is_some();
-    let detached_prompt_response = detached_cwd_prompt_response();
     let workdir = resolved_workdir(args);
 
     if let Some(ref config_path) = args.config {
@@ -1603,29 +1526,14 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     if let Some(request) =
         pending_cwd_access_request(&caps, &workdir, profile_workdir_access.as_ref())?
     {
-        if args.allow_cwd
-            || matches!(
-                detached_prompt_response,
-                Some(DetachedCwdPromptResponse::Allow)
-            )
-        {
-            let reason = if args.allow_cwd {
-                "(--allow-cwd)"
-            } else {
-                "(detached launch preflight)"
-            };
+        if args.allow_cwd {
             info!(
-                "Auto-including CWD with {} access {}",
-                request.access, reason
+                "Auto-including CWD with {} access (--allow-cwd)",
+                request.access
             );
             let cap = FsCapability::new_dir(&workdir, request.access)?;
             caps.add_fs(cap);
-        } else if matches!(
-            detached_prompt_response,
-            Some(DetachedCwdPromptResponse::Deny)
-        ) {
-            info!("Detached launch declined CWD sharing. Continuing without automatic CWD access.");
-        } else if missing_cwd_prompt_must_fail(silent, detached_launch, detached_prompt_response) {
+        } else if silent {
             return Err(NonoError::CwdPromptRequired);
         } else {
             let confirmed = output::prompt_cwd_sharing(&request.cwd_canonical, &request.access)?;
@@ -2095,35 +2003,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn missing_cwd_prompt_fails_in_silent_mode() {
-        assert!(missing_cwd_prompt_must_fail(true, false, None));
-    }
-
-    #[test]
-    fn missing_cwd_prompt_fails_for_unresolved_detached_launches() {
-        assert!(missing_cwd_prompt_must_fail(false, true, None));
-    }
-
-    #[test]
-    fn missing_cwd_prompt_does_not_fail_after_detached_preflight_decision() {
-        assert!(!missing_cwd_prompt_must_fail(
-            false,
-            true,
-            Some(DetachedCwdPromptResponse::Deny)
-        ));
-        assert!(!missing_cwd_prompt_must_fail(
-            false,
-            true,
-            Some(DetachedCwdPromptResponse::Allow)
-        ));
-    }
-
-    #[test]
-    fn missing_cwd_prompt_can_interactively_prompt_when_attached() {
-        assert!(!missing_cwd_prompt_must_fail(false, false, None));
-    }
-
     #[cfg(unix)]
     #[test]
     fn resolved_workdir_prefers_pwd_symlink_over_getcwd_when_valid() {
@@ -2208,22 +2087,6 @@ mod tests {
             pending_cwd_access_request(&caps, dir.path(), None)
                 .expect("request should evaluate")
                 .is_none()
-        );
-    }
-
-    #[test]
-    fn detached_cwd_prompt_response_env_values_round_trip() {
-        assert_eq!(
-            DetachedCwdPromptResponse::from_env_value(
-                DetachedCwdPromptResponse::Allow.as_env_value()
-            ),
-            Some(DetachedCwdPromptResponse::Allow)
-        );
-        assert_eq!(
-            DetachedCwdPromptResponse::from_env_value(
-                DetachedCwdPromptResponse::Deny.as_env_value()
-            ),
-            Some(DetachedCwdPromptResponse::Deny)
         );
     }
 

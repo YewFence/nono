@@ -1,5 +1,6 @@
+use crate::Result;
 use crate::audit_commands;
-use crate::cli::{Cli, Commands, RunArgs, SetupArgs};
+use crate::cli::{Cli, Commands, SetupArgs};
 use crate::command_runtime::{run_sandbox, run_shell, run_wrap};
 use crate::completions::run_completions;
 use crate::deprecated_policy;
@@ -13,13 +14,9 @@ use crate::registry_client::PullReason;
 use crate::rollback_commands;
 use crate::session_commands;
 use crate::setup;
-use crate::startup_runtime::{
-    allows_pre_exec_update_check, run_detached_launch, show_update_notification,
-};
 use crate::trust_cmd;
 use crate::update_check;
 use crate::why_runtime::run_why;
-use crate::{DETACHED_LAUNCH_ENV, Result};
 
 pub(crate) fn run(cli: Cli) -> Result<()> {
     let mut update_handle = start_update_check_handle(&cli);
@@ -41,7 +38,7 @@ fn dispatch_command(
 ) -> Result<()> {
     match command {
         Commands::Run(args) => {
-            run_command_with_update(update_handle, silent, || run_or_detach(*args, silent))
+            run_command_with_banner_and_update(update_handle, silent, || run_sandbox(*args, silent))
         }
         Commands::Shell(args) => {
             run_command_with_banner_and_update(update_handle, silent, || run_shell(*args, silent))
@@ -74,12 +71,6 @@ fn dispatch_command(
         Commands::Stop(args) => {
             run_command_with_update(update_handle, silent, || session_commands::run_stop(&args))
         }
-        Commands::Detach(args) => run_command_with_update(update_handle, silent, || {
-            session_commands::run_detach(&args)
-        }),
-        Commands::Attach(args) => run_command_with_update(update_handle, silent, || {
-            session_commands::run_attach(&args)
-        }),
         Commands::Logs(args) => {
             run_command_with_update(update_handle, silent, || session_commands::run_logs(&args))
         }
@@ -139,6 +130,25 @@ fn run_command_with_update<T>(
     command()
 }
 
+pub(crate) fn allows_pre_exec_update_check(command: &Commands) -> bool {
+    !matches!(
+        command,
+        Commands::Run(_)
+            | Commands::Shell(_)
+            | Commands::Wrap(_)
+            | Commands::Completions(_)
+            | Commands::PackUpdateHintHelper(_)
+    )
+}
+
+fn show_update_notification(handle: &mut Option<update_check::UpdateCheckHandle>, silent: bool) {
+    if let Some(handle) = handle.take()
+        && let Some(info) = handle.take_result()
+    {
+        output::print_update_notification(&info, silent);
+    }
+}
+
 fn run_command_with_banner_and_update<T>(
     update_handle: &mut Option<update_check::UpdateCheckHandle>,
     silent: bool,
@@ -146,15 +156,6 @@ fn run_command_with_banner_and_update<T>(
 ) -> Result<T> {
     output::print_banner(silent);
     run_command_with_update(update_handle, silent, command)
-}
-
-fn run_or_detach(args: RunArgs, silent: bool) -> Result<()> {
-    if args.detached && std::env::var_os(DETACHED_LAUNCH_ENV).is_none() {
-        run_detached_launch(args, silent)
-    } else {
-        output::print_banner(silent);
-        run_sandbox(args, silent)
-    }
 }
 
 fn run_setup(args: SetupArgs) -> Result<()> {

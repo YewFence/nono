@@ -44,10 +44,8 @@ pub(crate) struct LaunchPlan {
 #[derive(Clone, Default)]
 pub(crate) struct SessionLaunchOptions {
     pub(crate) session_id: Option<String>,
-    pub(crate) detached_start: bool,
     pub(crate) session_name: Option<String>,
     pub(crate) profile_name: Option<String>,
-    pub(crate) detach_sequence: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Default)]
@@ -313,7 +311,6 @@ pub(crate) fn prepare_run_launch_plan(
     cmd_args: Vec<OsString>,
     silent: bool,
 ) -> Result<LaunchPlan> {
-    let detach_sequence = load_configured_detach_sequence()?;
     let redaction_policy = load_configured_redaction_policy()?;
     let args = run_args.sandbox;
     let no_diagnostics = run_args.no_diagnostics;
@@ -392,10 +389,7 @@ pub(crate) fn prepare_run_launch_plan(
         prepared.caps.set_extensions_enabled(true);
     }
 
-    let session_id = std::env::var(crate::DETACHED_SESSION_ID_ENV)
-        .ok()
-        .filter(|id| !id.is_empty())
-        .unwrap_or_else(crate::session::generate_session_id);
+    let session_id = crate::session::generate_session_id();
     let network = prepare_proxy_launch_options(&args, &prepared, silent, session_id.clone())?;
     let rollback_options = prepare_rollback_launch_options(
         &run_args.rollback_exclude,
@@ -410,7 +404,6 @@ pub(crate) fn prepare_run_launch_plan(
         network.is_proxy_active(),
         prepared.capability_elevation,
         trust.interception_active,
-        run_args.detached,
     );
 
     let flags = ExecutionFlags {
@@ -421,10 +414,8 @@ pub(crate) fn prepare_run_launch_plan(
         diagnostic_verbosity: args.verbose,
         session: SessionLaunchOptions {
             session_id: Some(session_id),
-            detached_start: run_args.detached,
             session_name: run_args.name,
             profile_name: args.profile.clone(),
-            detach_sequence,
         },
         rollback: RollbackLaunchOptions {
             requested: rollback,
@@ -451,12 +442,6 @@ pub(crate) fn prepare_run_launch_plan(
         loaded_secrets: prepared.secrets,
         flags,
     })
-}
-
-pub(crate) fn load_configured_detach_sequence() -> Result<Option<Vec<u8>>> {
-    Ok(config::user::load_user_config()?
-        .and_then(|user_config| user_config.ui.detach_sequence)
-        .map(|sequence| sequence.bytes().to_vec()))
 }
 
 pub(crate) fn load_configured_redaction_policy() -> Result<nono::ScrubPolicy> {
@@ -611,14 +596,12 @@ pub(crate) fn select_exec_strategy(
     proxy_active: bool,
     capability_elevation: bool,
     trust_interception_active: bool,
-    detached_start: bool,
 ) -> exec_strategy::ExecStrategy {
     let _ = (
         rollback,
         proxy_active,
         capability_elevation,
         trust_interception_active,
-        detached_start,
     );
     exec_strategy::ExecStrategy::Supervised
 }
@@ -650,8 +633,6 @@ mod tests {
     fn run_args_with_sandbox(sandbox: SandboxArgs) -> RunArgs {
         RunArgs {
             sandbox,
-            detached: false,
-            detach_timeout_secs: None,
             rollback: false,
             no_rollback_prompt: false,
             no_rollback: false,

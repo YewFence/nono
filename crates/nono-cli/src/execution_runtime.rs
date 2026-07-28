@@ -5,8 +5,8 @@ use crate::launch_runtime::{LaunchPlan, select_threading_context};
 use crate::proxy_runtime::start_proxy_runtime;
 use crate::supervised_runtime::{SupervisedRuntimeContext, execute_supervised_runtime};
 use crate::{
-    DETACHED_SESSION_ID_ENV, command_blocking_deprecation, config, exec_strategy, network_policy,
-    output, sandbox_state, session,
+    command_blocking_deprecation, config, exec_strategy, network_policy, output, sandbox_state,
+    session,
 };
 use nono::undo::{ContentHash, ExecutableIdentity};
 use nono::{AccessMode, CapabilitySet, FsCapability, NonoError, Result, Sandbox};
@@ -510,13 +510,9 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     // Session id shared across before- and after-hook so paired setup/teardown
     // scripts see the same NONO_SESSION_ID. Only allocated when at least one
     // hook is configured.
-    let hook_session_id: Option<String> =
-        (flags.session_hooks.before.is_some() || flags.session_hooks.after.is_some()).then(|| {
-            std::env::var(DETACHED_SESSION_ID_ENV)
-                .ok()
-                .filter(|id| !id.is_empty())
-                .unwrap_or_else(session::generate_session_id)
-        });
+    let hook_session_id: Option<String> = (flags.session_hooks.before.is_some()
+        || flags.session_hooks.after.is_some())
+    .then(session::generate_session_id);
 
     // ---- Before-hook execution (Unix-only) ----
     #[cfg(unix)]

@@ -37,10 +37,8 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
   proxy      Run the network filtering / credential proxy as a standalone server
 
 \x1b[1mSESSION MANAGEMENT\x1b[0m
-  ps         List running or detached sandbox sessions
+  ps         List sandbox sessions
   stop       Stop a running sandbox session
-  detach     Detach from an interactive runtime session
-  attach     Attach to a detached runtime session
   logs       View runtime session event logs
   inspect    Show detailed runtime session state
   session    Manage runtime session storage
@@ -345,60 +343,6 @@ pub enum Commands {
     nono stop --force a3f7c2
 ")]
     Stop(StopArgs),
-
-    /// Detach from a running sandboxed session and return to the shell
-    #[command(
-        help_template = "\
-{about}
-
-\x1b[1mUSAGE\x1b[0m
-  nono detach <session>
-
-{all-args}
-{after-help}",
-        alias = "pause",
-        after_help = "EXAMPLES:
-    # Detach by session ID
-    nono detach a3f7c2
-
-    # Detach by name
-    nono detach calm-gate
-
-IN-BAND DETACH:
-    By default, press Ctrl-] then d to detach without opening a second terminal.
-    This can be changed in ~/.config/nono/config.toml:
-      [ui]
-      detach_sequence = \"ctrl-] d\"
-"
-    )]
-    Detach(DetachArgs),
-
-    /// Attach to a detached or running session from another terminal
-    #[command(
-        help_template = "\
-{about}
-
-\x1b[1mUSAGE\x1b[0m
-  nono attach <session>
-
-{all-args}
-{after-help}",
-        alias = "resume",
-        after_help = "EXAMPLES:
-    # Attach by session ID
-    nono attach a3f7c2
-
-    # Attach by name
-    nono attach calm-gate
-
-IN-BAND DETACH:
-    By default, press Ctrl-] then d to detach from the session.
-    This can be changed in ~/.config/nono/config.toml:
-      [ui]
-      detach_sequence = \"ctrl-] d\"
-"
-    )]
-    Attach(AttachArgs),
 
     /// View event log for a session
     #[command(help_template = "\
@@ -1957,23 +1901,6 @@ pub struct RunArgs {
     #[command(flatten)]
     pub sandbox: SandboxArgs,
 
-    /// Start the session without attaching the current terminal.
-    /// The supervisor keeps the sandboxed process running in the background;
-    /// use `nono attach <session>` later to inspect or interact with it.
-    #[arg(long, help_heading = "OPTIONS")]
-    pub detached: bool,
-
-    /// How long (seconds) to wait for a detached session to become attachable.
-    /// Only meaningful with --detached. Env: NONO_DETACH_STARTUP_TIMEOUT.
-    #[arg(
-        long = "detach-timeout",
-        value_name = "SECS",
-        requires = "detached",
-        env = "NONO_DETACH_STARTUP_TIMEOUT",
-        help_heading = "OPTIONS"
-    )]
-    pub detach_timeout_secs: Option<u64>,
-
     // ── Rollback ──────────────────────────────────────────────────────
     /// Enable atomic rollback snapshots for the session
     #[arg(long, conflicts_with = "no_rollback", help_heading = "ROLLBACK")]
@@ -2684,18 +2611,6 @@ pub struct StopArgs {
     /// Grace period in seconds before SIGKILL (default: 10)
     #[arg(long, default_value = "10")]
     pub timeout: u64,
-}
-
-#[derive(Parser, Debug)]
-pub struct DetachArgs {
-    /// Session ID, prefix, or name
-    pub session: String,
-}
-
-#[derive(Parser, Debug)]
-pub struct AttachArgs {
-    /// Session ID, prefix, or name
-    pub session: String,
 }
 
 #[derive(Parser, Debug)]
@@ -4420,8 +4335,6 @@ mod tests {
         "proxy",
         "ps",
         "stop",
-        "detach",
-        "attach",
         "logs",
         "inspect",
         "session",
@@ -4472,6 +4385,22 @@ mod tests {
                  Add it to the constant and to the root help_template.",
             );
         }
+    }
+
+    #[test]
+    fn test_terminal_session_commands_are_removed() {
+        assert!(Cli::try_parse_from(["nono", "attach", "session-id"]).is_err());
+        assert!(Cli::try_parse_from(["nono", "detach", "session-id"]).is_err());
+        assert!(Cli::try_parse_from(["nono", "resume", "session-id"]).is_err());
+        assert!(Cli::try_parse_from(["nono", "pause", "session-id"]).is_err());
+    }
+
+    #[test]
+    fn test_detached_run_options_are_removed() {
+        assert!(Cli::try_parse_from(["nono", "run", "--detached", "--", "true"]).is_err());
+        assert!(
+            Cli::try_parse_from(["nono", "run", "--detach-timeout", "5", "--", "true"]).is_err()
+        );
     }
 
     #[test]

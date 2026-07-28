@@ -8,8 +8,7 @@ use crate::rollback_runtime::{
     initialize_audit_snapshots, initialize_rollback_state, warn_if_rollback_flags_ignored,
 };
 use crate::{
-    DETACHED_SESSION_ID_ENV, exec_strategy, output, protected_paths, pty_proxy, session,
-    terminal_approval, trust_intercept,
+    exec_strategy, output, protected_paths, pty_proxy, session, terminal_approval, trust_intercept,
 };
 use colored::Colorize;
 use nono::undo::ExecutableIdentity;
@@ -91,11 +90,6 @@ fn create_session_runtime_state(
     let short_session_id = session
         .session_id
         .clone()
-        .or_else(|| {
-            std::env::var(DETACHED_SESSION_ID_ENV)
-                .ok()
-                .filter(|id| !id.is_empty())
-        })
         .unwrap_or_else(session::generate_session_id);
     let session_record = session::SessionRecord {
         session_id: short_session_id.clone(),
@@ -110,11 +104,6 @@ fn create_session_runtime_state(
         started: started.clone(),
         started_epoch: session::current_process_start_epoch(),
         status: session::SessionStatus::Running,
-        attachment: if session.detached_start {
-            session::SessionAttachment::Detached
-        } else {
-            session::SessionAttachment::Attached
-        },
         exit_code: None,
         command: nono::scrub_argv_with_policy(command, redaction_policy),
         profile: session.profile_name.clone(),
@@ -128,7 +117,6 @@ fn create_session_runtime_state(
     };
     let session_guard = Some(session::SessionGuard::new(session_record)?);
     let pty_pair = if should_open_supervised_pty(
-        session.detached_start,
         std::io::stdin().is_terminal(),
         std::io::stdout().is_terminal(),
         std::io::stderr().is_terminal(),
@@ -195,12 +183,11 @@ const fn is_ordinary_failure_exit(exit_code: i32) -> bool {
 }
 
 fn should_open_supervised_pty(
-    detached_start: bool,
     stdin_is_terminal: bool,
     stdout_is_terminal: bool,
     stderr_is_terminal: bool,
 ) -> bool {
-    detached_start || (stdin_is_terminal && stdout_is_terminal && stderr_is_terminal)
+    stdin_is_terminal && stdout_is_terminal && stderr_is_terminal
 }
 
 pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> Result<i32> {
@@ -228,12 +215,8 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     )?;
     warn_if_rollback_flags_ignored(rollback, silent);
 
-    // Create the session guard (writes session file) and PTY pair BEFORE
-    // rollback initialization.  Rollback's baseline snapshot can take many
-    // seconds on large repos.  In detached mode the launcher is polling for
-    // the session file and attach socket — if we delay session registration
-    // until after the baseline walk, the 30-second startup timeout can fire
-    // before the session becomes attachable.
+    // Create the session guard and PTY pair before rollback initialization so
+    // session management can observe long-running baseline snapshots.
     let trust_interceptor = create_trust_interceptor(trust);
     let session_runtime = create_session_runtime_state(
         command,
@@ -299,8 +282,6 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         protected_roots: protected_roots.as_paths(),
         approval_backend: &approval_backend,
         session_id: &supervisor_session_id,
-        attach_initial_client: !session.detached_start,
-        detach_sequence: session.detach_sequence.as_deref(),
         open_url_origins: proxy
             .and_then(|p| p.open_url.as_ref())
             .map(|o| o.origins.as_slice())
@@ -566,15 +547,10 @@ mod tests {
     }
 
     #[test]
-    fn supervised_pty_is_used_for_attached_terminals() {
-        assert!(should_open_supervised_pty(false, true, true, true));
-        assert!(!should_open_supervised_pty(false, false, true, true));
-        assert!(!should_open_supervised_pty(false, true, false, true));
-        assert!(!should_open_supervised_pty(false, true, true, false));
-    }
-
-    #[test]
-    fn supervised_pty_is_always_used_for_detached_start() {
-        assert!(should_open_supervised_pty(true, false, false, false));
+    fn supervised_pty_is_used_for_terminal_stdio() {
+        assert!(should_open_supervised_pty(true, true, true));
+        assert!(!should_open_supervised_pty(false, true, true));
+        assert!(!should_open_supervised_pty(true, false, true));
+        assert!(!should_open_supervised_pty(true, true, false));
     }
 }
