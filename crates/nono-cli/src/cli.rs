@@ -121,7 +121,7 @@ pub enum Commands {
     Setup(SetupArgs),
 
     // ── Core usage ──────────────────────────────────────────────────────
-    /// Run a command inside the sandbox
+    /// Run a command inside the sandbox with the caller's stdin, stdout, and stderr
     #[command(trailing_var_arg = true)]
     #[command(help_template = "\
 {about}
@@ -144,7 +144,7 @@ pub enum Commands {
 ")]
     Run(Box<RunArgs>),
 
-    /// Start an interactive shell inside the sandbox
+    /// Start a sandboxed shell using the caller's stdin, stdout, and stderr
     #[command(help_template = "\
 {about}
 

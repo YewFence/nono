@@ -50,6 +50,21 @@ Given the alpha status:
 
 Use in production environments is **not recommended** at this stage.
 
+### Interactive Terminal Boundary
+
+For `nono run` and `nono shell`, the sandboxed child inherits the caller's stdin,
+stdout, and stderr. Filesystem, network, credentials, process inspection,
+signaling, and executable access remain subject to the configured OS sandbox and
+policy. The interactive terminal itself is an explicit shared channel and is not
+an isolation boundary.
+
+A sandboxed process with a terminal file descriptor can read input addressed to
+the foreground job, change termios state, and emit ANSI or OSC control sequences.
+On Linux, nono additionally denies `ioctl(TIOCSTI)` with `EPERM` for sandboxed
+children and their descendants. This is defense in depth against terminal input
+injection, not general terminal isolation. macOS does not currently have an
+equivalent nono-enforced ioctl filter.
+
 ---
 
 ## Future Security Work

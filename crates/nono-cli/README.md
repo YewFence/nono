@@ -58,6 +58,39 @@ nono why --path ~/.ssh/id_rsa --op read
 nono run --allow-cwd --dry-run -- command
 ```
 
+## Terminal and standard I/O
+
+`nono run` and `nono shell` pass the caller's stdin, stdout, and stderr directly
+to the sandboxed child. This preserves terminals, pipes, file redirects, closed
+descriptors, and mixed redirection without a nono-owned PTY or I/O relay. The
+supervisor still waits for the child and provides sandbox enforcement, audit,
+network and credential proxies, rollback, resource limits, and structured
+diagnostics, but it does not observe or replay terminal output.
+
+An interactive terminal is therefore an explicit shared channel, not a sandbox
+isolation boundary. A child can change terminal modes and emit terminal control
+sequences. The invoking shell or terminal is responsible for restoring terminal
+state after the job. If the main child exits while background descendants still
+hold stdout or stderr, their output may appear before or after nono's diagnostic
+footer; nono does not relay output to impose an ordering guarantee.
+
+On Linux, nono installs a seccomp filter that rejects `ioctl(TIOCSTI)` with
+`EPERM` in sandboxed children and their descendants. Other terminal ioctls,
+including termios and window-size operations, remain available. macOS does not
+currently provide an equivalent nono-enforced `TIOCSTI` filter.
+
+Runtime sessions remain manageable independently of terminal ownership:
+
+- `nono ps` lists running or recorded sandbox sessions.
+- `nono stop` terminates a running session.
+- `nono logs` reads structured session events.
+- `nono inspect` shows session metadata and optional events.
+- `nono prune` or `nono session cleanup` removes old runtime records.
+
+Sessions cannot be attached to or detached from a terminal. Runtime permission
+decisions use configured non-terminal approval backends; nono does not prompt on
+the terminal while a child is running.
+
 ## Themes
 
 The CLI supports named output themes for banners, summaries, warnings, and status text.

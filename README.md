@@ -78,6 +78,7 @@ $ nono run --profile nolabs-ai/opencode -- opencode
 ```
 
 That's it. `opencode` now runs with read/write access to the current directory and **nothing else** — your SSH keys, your cloud credentials, the rest of your disk are invisible to it.
+Its stdin, stdout, and stderr still connect directly to your terminal or redirects; the terminal is a shared channel, not part of the sandbox boundary.
 
 Profiles for all the popular agents live at [registry.nono.sh](https://registry.nono.sh), secured and ready to pull. Each one bundles the right filesystem scope, network allowlist, hooks, skills and more.
 
@@ -159,7 +160,7 @@ Read more in [Sandboxed Tool Execution](https://nono.sh/docs/cli/features/tool-s
 
 ## Ready to go deep?
 
-Head over to the [docs](https://nono.sh/docs) and discover nono's rich composable policy system, credentials injection, L7 filtering, supply chain security, rollback, multiplexing, audit and more.
+Head over to the [docs](https://nono.sh/docs) and discover nono's rich composable policy system, credentials injection, L7 filtering, supply chain security, rollback, session management, audit and more.
 
 ## Library support
 
