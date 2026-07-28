@@ -72,7 +72,6 @@ mod sandbox_state;
 mod session;
 mod session_commands;
 mod setup;
-mod startup_prompt;
 mod state_paths;
 mod supervised_runtime;
 mod theme;

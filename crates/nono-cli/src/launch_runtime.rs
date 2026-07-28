@@ -245,7 +245,6 @@ pub(crate) struct ExecutionFlags {
     pub(crate) denied_env_vars: Option<Vec<String>>,
     /// Expanded `environment.set_vars` (key, expanded-value), `None` if absent.
     pub(crate) set_vars: Option<Vec<(String, String)>>,
-    pub(crate) startup_timeout_secs: Option<u64>,
     pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
     /// Command binaries already resolved while validating `command_policies`,
     /// reused when building the tool-sandbox plan instead of re-resolving.
@@ -298,7 +297,6 @@ impl ExecutionFlags {
             allowed_env_vars: prepared.allowed_env_vars.clone(),
             denied_env_vars: prepared.denied_env_vars.clone(),
             set_vars: prepared.set_vars.clone(),
-            startup_timeout_secs: None,
             command_policies: prepared.command_policies.clone(),
             resolved_command_binaries: prepared.resolved_command_binaries.clone(),
         })
@@ -321,7 +319,6 @@ pub(crate) fn prepare_run_launch_plan(
     let no_audit_integrity = run_args.no_audit_integrity;
     let audit_sign_key = run_args.audit_sign_key.clone();
     let trust_override = run_args.trust_override;
-    let startup_timeout_secs = run_args.startup_timeout_secs;
 
     if no_audit && !silent {
         eprintln!("  [nono] Warning: --no-audit disables session and command-policy audit events.");
@@ -431,7 +428,6 @@ pub(crate) fn prepare_run_launch_plan(
         trust,
         network,
         redaction_policy,
-        startup_timeout_secs,
         ..ExecutionFlags::from_prepared(&prepared, silent)?
     };
     Ok(LaunchPlan {
@@ -643,7 +639,6 @@ mod tests {
             rollback_dest: None,
             no_diagnostics: false,
             diagnostics_json: false,
-            startup_timeout_secs: None,
             no_audit: false,
             no_audit_integrity: false,
             audit_integrity: false,

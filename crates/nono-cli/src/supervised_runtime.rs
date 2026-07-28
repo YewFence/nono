@@ -495,9 +495,7 @@ mod tests {
 
     /// The memory-cap diagnostic fires only on exit 137 (the whole-sandbox OOM
     /// kill). Pins that a clean exit, an ordinary crash (SIGSEGV -> 139), or a
-    /// SIGTERM (-> 143) is NOT mistaken for an out-of-memory kill. (The other half
-    /// of the gate — a watchdog-timeout SIGKILL, also 137, suppressed via
-    /// !killed_by_timeout — lives in exec_strategy and is covered by review.)
+    /// SIGTERM (-> 143) is NOT mistaken for an out-of-memory kill.
     #[test]
     #[cfg(target_os = "linux")]
     fn only_exit_137_is_treated_as_an_oom_kill() {

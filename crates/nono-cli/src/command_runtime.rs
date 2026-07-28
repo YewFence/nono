@@ -282,7 +282,6 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
         strategy,
         workdir: resolve_requested_workdir(args.sandbox.workdir.as_ref()),
         no_diagnostics: true,
-        startup_timeout_secs: args.startup_timeout_secs,
         network,
         redaction_policy: load_configured_redaction_policy()?,
         session: SessionLaunchOptions {
@@ -426,7 +425,6 @@ mod tests {
             },
             shell: Some(PathBuf::from("/bin/sh")),
             name: None,
-            startup_timeout_secs: None,
             help: None,
         };
 

@@ -1953,17 +1953,6 @@ pub struct RunArgs {
     #[arg(long = "diagnostics-json", help_heading = "OPTIONS")]
     pub diagnostics_json: bool,
 
-    /// Kill the process if it has not entered alt-screen mode after this many seconds.
-    /// Startup banners and log lines do not count; only a full-screen TUI transition satisfies the check.
-    /// Set to 0 to disable. Env: NONO_STARTUP_TIMEOUT.
-    #[arg(
-        long = "startup-timeout",
-        value_name = "SECS",
-        env = "NONO_STARTUP_TIMEOUT",
-        help_heading = "OPTIONS"
-    )]
-    pub startup_timeout_secs: Option<u64>,
-
     /// Disable the audit trail for this session
     #[arg(
         long,
@@ -2039,16 +2028,6 @@ pub struct ShellArgs {
     /// Name for this session (shown in `nono ps`)
     #[arg(long, value_name = "NAME", help_heading = "OPTIONS")]
     pub name: Option<String>,
-
-    /// Kill the process if it has not become interactive after this many seconds.
-    /// Set to 0 to disable. Env: NONO_STARTUP_TIMEOUT.
-    #[arg(
-        long = "startup-timeout",
-        value_name = "SECS",
-        env = "NONO_STARTUP_TIMEOUT",
-        help_heading = "OPTIONS"
-    )]
-    pub startup_timeout_secs: Option<u64>,
 
     /// Print help
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
@@ -4401,6 +4380,14 @@ mod tests {
         assert!(
             Cli::try_parse_from(["nono", "run", "--detach-timeout", "5", "--", "true"]).is_err()
         );
+    }
+
+    #[test]
+    fn test_startup_timeout_options_are_removed() {
+        assert!(
+            Cli::try_parse_from(["nono", "run", "--startup-timeout", "5", "--", "true"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["nono", "shell", "--startup-timeout", "5"]).is_err());
     }
 
     #[test]

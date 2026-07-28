@@ -14,7 +14,6 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use std::time::Duration;
 use tracing::{error, info, warn};
 
 fn apply_pre_fork_sandbox(
@@ -697,14 +696,6 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             .or(recommended_profile),
         ignored_denial_paths: &flags.ignored_denial_paths,
         suppressed_system_service_operations: &flags.suppressed_system_service_operations,
-        startup_timeout: flags
-            .startup_timeout_secs
-            .filter(|&secs| secs > 0)
-            .map(|secs| exec_strategy::StartupTimeoutConfig {
-                timeout: Duration::from_secs(secs),
-                program: recommended_program_name,
-                recommended_profile: known_builtin_profile,
-            }),
         #[cfg(target_os = "linux")]
         seccomp_policy: exec_strategy::SeccompPolicy {
             capability_elevation: flags.capability_elevation,

@@ -5,7 +5,4 @@
 
 mod formatter;
 
-pub use formatter::{
-    CommandContext, DiagnosticFormatter, DiagnosticMode, ErrorObservation, PolicyExplanation,
-    analyze_error_output,
-};
+pub use formatter::{CommandContext, DiagnosticFormatter, DiagnosticMode, PolicyExplanation};

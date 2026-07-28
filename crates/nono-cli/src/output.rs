@@ -11,7 +11,7 @@ use colored::Colorize;
 use nono::resource::format_bytes;
 use nono::{AccessMode, CapabilitySet, NetworkMode, NonoError, Result};
 use std::ffi::{OsStr, OsString};
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -24,6 +24,16 @@ const BADGE_FG_DARK: Rgb = Rgb(30, 30, 46);
 fn rule() {
     let t = theme::current();
     eprintln!("  {}", theme::fg(&"\u{2500}".repeat(52), t.overlay));
+}
+
+pub(crate) fn print_terminal_safe_stderr(message: &str) {
+    let mut stderr = io::stderr();
+    if stderr.is_terminal() {
+        let normalized = message.replace('\n', "\r\n");
+        let _ = writeln!(stderr, "\r{normalized}");
+    } else {
+        let _ = writeln!(stderr, "{message}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -734,48 +744,6 @@ fn proxy_diagnostic_action(code: &nono_proxy::ProxyDiagnosticCode) -> Option<&'s
     }
 }
 
-/// Format startup-blocked lines for writing to /dev/tty or stderr.
-/// Returns a Vec of lines ready to write (without trailing newline).
-pub fn format_startup_blocked(
-    program: &str,
-    timeout_secs: u64,
-    has_output: bool,
-    recommended_profile: Option<&str>,
-) -> Vec<String> {
-    let t = theme::current();
-    let label = fg("blocked:", t.yellow).bold().to_string();
-    let reason = if has_output {
-        format!(
-            "`{}` has not become interactive after {} seconds.",
-            program, timeout_secs
-        )
-    } else {
-        format!(
-            "`{}` produced no terminal output after {} seconds.",
-            program, timeout_secs
-        )
-    };
-    let mut lines = vec![
-        format!("  {} {}", label, fg(&reason, t.text)),
-        format!(
-            "  {}",
-            fg(
-                "Terminating process — re-run with -v to inspect denied paths.",
-                t.subtext
-            )
-        ),
-    ];
-    if let Some(profile) = recommended_profile {
-        lines.push(format!(
-            "  {} nono run --profile {} -- {}",
-            fg("Try:", t.green).bold(),
-            profile,
-            program,
-        ));
-    }
-    lines
-}
-
 /// Print a styled diagnostic footer emitted by the core diagnostic formatter.
 pub fn print_diagnostic_footer(footer: &str) {
     let rendered = render_diagnostic_footer(footer);
@@ -794,7 +762,7 @@ pub fn print_oom_diagnostic(report: &OomReport, silent: bool) {
         return;
     }
     let t = theme::current();
-    let emit = crate::startup_prompt::print_terminal_safe_stderr;
+    let emit = print_terminal_safe_stderr;
 
     // A labelled row: indented, the label padded on the plain text before
     // coloring so values line up despite the invisible ANSI escapes.
@@ -860,7 +828,7 @@ pub fn print_pids_diagnostic(report: &PidsReport, silent: bool) {
         return;
     }
     let t = theme::current();
-    let emit = crate::startup_prompt::print_terminal_safe_stderr;
+    let emit = print_terminal_safe_stderr;
 
     // Pad to the longest label ("limit (--max-processes):" == 24) so the values
     // line up, matching the memory diagnostic's aligned look.

@@ -15,7 +15,7 @@ pub(crate) mod env_sanitization;
 mod supervisor_linux;
 
 use crate::diagnostic::{DiagnosticFormatter, DiagnosticMode};
-use crate::startup_prompt::{notify_startup_termination_for_child, print_terminal_safe_stderr};
+use crate::output::print_terminal_safe_stderr;
 use nix::libc;
 use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
@@ -35,7 +35,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::{debug, info, warn};
 
 pub(crate) use env_sanitization::is_dangerous_env_var;
@@ -102,8 +102,6 @@ use crate::timeouts;
 
 pub(crate) struct ProfileSaveOffer<'a> {
     pub(crate) policy_explanations: &'a [crate::diagnostic::PolicyExplanation],
-    pub(crate) error_observation: &'a crate::diagnostic::ErrorObservation,
-    pub(crate) caps: &'a CapabilitySet,
     pub(crate) command: &'a [std::ffi::OsString],
     pub(crate) compared_profile: Option<&'a str>,
     pub(crate) sandbox_violations: &'a [nono::SandboxViolation],
@@ -282,9 +280,6 @@ pub struct ExecConfig<'a> {
     pub ignored_denial_paths: &'a [std::path::PathBuf],
     /// Non-filesystem sandbox operations suppressed from diagnostic footers.
     pub suppressed_system_service_operations: &'a [String],
-    /// Optional startup timeout for known interactive CLIs that were launched
-    /// without their recommended built-in profile.
-    pub startup_timeout: Option<StartupTimeoutConfig<'a>>,
     /// Seccomp-notify policy for this session. Controls which notify fds are
     /// installed in the child and how the supervisor handles their events.
     #[cfg(target_os = "linux")]
@@ -308,15 +303,6 @@ pub struct ExecConfig<'a> {
     /// and an additional Linux execute-only Landlock gate.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub tool_sandbox_runtime: Option<&'a crate::tool_sandbox::PreparedToolSandboxRuntime>,
-}
-
-#[derive(Clone, Copy)]
-pub struct StartupTimeoutConfig<'a> {
-    pub timeout: Duration,
-    pub program: &'a str,
-    /// Populated only when the binary matches a known built-in profile; used
-    /// solely to enrich the "try --profile X" hint message.
-    pub recommended_profile: Option<&'a str>,
 }
 
 /// Configuration for supervisor IPC in supervised execution mode.
@@ -467,9 +453,8 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
 /// 4. Child: apply Landlock, install seccomp-notify, close inherited FDs, exec
 /// 5. Parent: apply PR_SET_DUMPABLE(0) + PT_DENY_ATTACH, receive seccomp fd, run supervisor loop
 ///
-/// When a PTY pair is provided, the child runs behind the PTY proxy so the
-/// parent can capture terminal output for diagnostics while the child still sees
-/// a TTY. Otherwise the child inherits the parent's terminal directly.
+/// When a PTY pair is provided, the child runs behind the PTY proxy so it sees a
+/// TTY. Otherwise the child inherits the parent's terminal directly.
 /// The parent prints diagnostics and rollback UI after the child exits.
 ///
 /// Append `set_vars` to a raw `execve` environment vector, deduplicating by key.
@@ -1536,7 +1521,6 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     .collect()
             };
 
-            let mut killed_by_timeout = false;
             let (status, denials, ipc_denials, url_denials) =
                 if let (Some(sup_cfg), Some(mut sup_sock)) = (supervisor, supervisor_sock) {
                     #[cfg(target_os = "linux")]
@@ -1545,14 +1529,12 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                             child,
                             &mut sup_sock,
                             sup_cfg,
-                            config.startup_timeout,
                             seccomp_notify_fd.as_ref(),
                             proxy_notify_fd.as_ref(),
                             &initial_caps,
                             trust_interceptor,
                             pty_proxy.as_mut(),
                             url_listener.as_ref().map(|(l, _)| l),
-                            &mut killed_by_timeout,
                         )?;
                         (status, denials, ipc_denials, url_denials)
                     }
@@ -1562,21 +1544,14 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                             child,
                             &mut sup_sock,
                             sup_cfg,
-                            config.startup_timeout,
                             trust_interceptor,
                             pty_proxy.as_mut(),
                             url_listener.as_ref().map(|(l, _)| l),
-                            &mut killed_by_timeout,
                         )?;
                         (status, denials, Vec::new(), url_denials)
                     }
                 } else {
-                    let status = wait_for_child_with_pty(
-                        child,
-                        pty_proxy.as_mut(),
-                        config.startup_timeout,
-                        &mut killed_by_timeout,
-                    )?;
+                    let status = wait_for_child_with_pty(child, pty_proxy.as_mut())?;
                     (status, Vec::new(), Vec::new(), Vec::new())
                 };
 
@@ -1589,14 +1564,14 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                 WaitStatus::Exited(_, code) => {
                     debug!("Supervised child exited with code {}", code);
                     let by_signal = (129..=143).contains(&code);
-                    if by_signal && !config.no_diagnostics && !killed_by_timeout {
+                    if by_signal && !config.no_diagnostics {
                         print_terminal_safe_stderr("[nono] Session stopped.");
                     }
                     code
                 }
                 WaitStatus::Signaled(_, sig, _) => {
                     debug!("Supervised child killed by signal {}", sig);
-                    if !config.no_diagnostics && !killed_by_timeout {
+                    if !config.no_diagnostics {
                         print_terminal_safe_stderr("[nono] Session stopped.");
                     }
                     128 + sig as i32
@@ -1611,35 +1586,13 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
             // turning a bare SIGKILL into a memory-cap diagnostic). If it does,
             // the generic footer below is suppressed so the user gets one story.
             //
-            // Gated on `!killed_by_timeout`: a watchdog timeout also kills with
-            // SIGKILL (exit 137), the same code an OOM kill produces. Without this
-            // gate the hook could borrow the "memory cap exceeded" story for a
-            // timeout kill that merely coincided with an earlier OOM-reap in the
-            // leaf — attributing the death to the wrong cause.
-            let specialized_diagnostic = !killed_by_timeout
-                && on_exit_diagnostic
-                    .take()
-                    .is_some_and(|mut hook| hook(exit_code));
+            let specialized_diagnostic = on_exit_diagnostic
+                .take()
+                .is_some_and(|mut hook| hook(exit_code));
 
-            // Analyze PTY screen content for sandbox-related errors.
-            let pty_screen = pty_proxy
-                .as_ref()
-                .map(crate::pty_proxy::PtyProxy::screen_plaintext)
-                .unwrap_or_default();
-            let error_observation = if pty_screen.is_empty() {
-                crate::diagnostic::ErrorObservation::default()
-            } else {
-                crate::diagnostic::analyze_error_output(
-                    &pty_screen,
-                    config.protected_paths,
-                    Some(config.current_dir),
-                )
-            };
-            let tool_sandbox_policy_denial =
-                output_contains_tool_sandbox_policy_denial(&pty_screen)
-                    || config.tool_sandbox_runtime.is_some_and(
-                        crate::tool_sandbox::PreparedToolSandboxRuntime::emitted_error_response,
-                    );
+            let tool_sandbox_policy_denial = config.tool_sandbox_runtime.is_some_and(
+                crate::tool_sandbox::PreparedToolSandboxRuntime::emitted_error_response,
+            );
 
             let mode = if supervisor.is_some() {
                 DiagnosticMode::Supervised
@@ -1649,8 +1602,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
 
             #[cfg(target_os = "macos")]
             let sandbox_violations = if supervisor.is_some() {
-                let include_historical_sandbox_log =
-                    exit_code != 0 || !denials.is_empty() || error_observation.has_findings();
+                let include_historical_sandbox_log = exit_code != 0 || !denials.is_empty();
                 match sandbox_log_collector {
                     Some(collector) if include_historical_sandbox_log => collector.finish(),
                     Some(collector) => collector.finish_realtime_only(),
@@ -1672,25 +1624,22 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
             let policy_explanations =
                 build_policy_explanations(&denials, &visible_sandbox_violations, config.caps);
             let prompt_policy_explanations = policy_explanations.clone();
-            let prompt_error_observation = error_observation.clone();
 
-            let should_print_diagnostics = !killed_by_timeout
-                && !specialized_diagnostic
+            let should_print_diagnostics = !specialized_diagnostic
                 && should_print_diagnostic_footer(
                     config.no_diagnostics,
                     exit_code,
                     &denials,
                     &ipc_denials,
                     &visible_sandbox_violations,
-                    &error_observation,
                 )
                 && !should_suppress_diagnostics_for_tool_sandbox_denial(
                     config.diagnostic_verbosity,
                     tool_sandbox_policy_denial,
                 );
 
-            // Print diagnostic footer on non-zero exit or when the PTY
-            // output or OS sandbox logs show a likely sandbox-related issue.
+            // Print diagnostic footer on non-zero exit or when structured
+            // sandbox evidence shows a likely sandbox-related issue.
             if should_print_diagnostics || config.diagnostics_json {
                 let diag_session_id = if supervisor.is_some() {
                     pty_session_id
@@ -1718,7 +1667,6 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     .with_ipc_denials(&ipc_denials)
                     .with_sandbox_violations(&sandbox_violations)
                     .with_protected_paths(config.protected_paths)
-                    .with_error_observation(error_observation)
                     .with_current_dir(config.current_dir)
                     .with_session_id(diag_session_id)
                     .with_policy_explanations(policy_explanations)
@@ -1762,7 +1710,6 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     config.no_diagnostics,
                     exit_code,
                     &prompt_policy_explanations,
-                    &prompt_error_observation,
                     &visible_sandbox_violations,
                     &url_denials,
                 )
@@ -1773,8 +1720,6 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                 clear_signal_forwarding_target();
                 let offer = ProfileSaveOffer {
                     policy_explanations: &prompt_policy_explanations,
-                    error_observation: &prompt_error_observation,
-                    caps: config.caps,
                     command: config.command,
                     compared_profile: config.profile_save_base,
                     sandbox_violations: &visible_sandbox_violations,
@@ -1788,12 +1733,6 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
         }
         Err(e) => Err(NonoError::SandboxInit(format!("fork() failed: {}", e))),
     }
-}
-
-fn output_contains_tool_sandbox_policy_denial(output: &str) -> bool {
-    output
-        .lines()
-        .any(|line| line.trim_start().starts_with("nono: tool-sandbox denied "))
 }
 
 fn should_suppress_diagnostics_for_tool_sandbox_denial(
@@ -1940,14 +1879,12 @@ fn should_print_diagnostic_footer(
     denials: &[nono::diagnostic::DenialRecord],
     ipc_denials: &[nono::diagnostic::IpcDenialRecord],
     sandbox_violations: &[nono::SandboxViolation],
-    error_observation: &crate::diagnostic::ErrorObservation,
 ) -> bool {
     !no_diagnostics
         && (exit_code != 0
             || !denials.is_empty()
             || !ipc_denials.is_empty()
-            || !sandbox_violations.is_empty()
-            || error_observation.has_findings())
+            || !sandbox_violations.is_empty())
 }
 
 fn filter_suppressed_system_service_violations(
@@ -1972,14 +1909,12 @@ fn should_offer_profile_save(
     no_diagnostics: bool,
     exit_code: i32,
     policy_explanations: &[crate::diagnostic::PolicyExplanation],
-    error_observation: &crate::diagnostic::ErrorObservation,
     sandbox_violations: &[nono::SandboxViolation],
     url_denials: &[UrlDenialRecord],
 ) -> bool {
     !no_diagnostics
         && (exit_code != 0
             || !policy_explanations.is_empty()
-            || !error_observation.path_hints.is_empty()
             || crate::profile_save_runtime::has_saveable_system_service_rules(sandbox_violations)
             || has_fixable_url_denials(url_denials))
 }
@@ -2031,8 +1966,6 @@ fn get_max_fd() -> i32 {
 fn wait_for_child_with_pty(
     child: Pid,
     pty: Option<&mut crate::pty_proxy::PtyProxy>,
-    startup_timeout: Option<StartupTimeoutConfig<'_>>,
-    killed_by_timeout: &mut bool,
 ) -> Result<WaitStatus> {
     let pty = match pty {
         Some(pty) => pty,
@@ -2040,8 +1973,6 @@ fn wait_for_child_with_pty(
             return wait_for_child(child);
         }
     };
-    let startup_deadline = startup_timeout.map(|cfg| (Instant::now() + cfg.timeout, cfg));
-
     loop {
         let (master_fd, client_fd) = pty.poll_fds();
         let mut pfds = [
@@ -2074,23 +2005,7 @@ fn wait_for_child_with_pty(
         handle_pty_suspension(Some(pty), child);
 
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::StillAlive) => {
-                if let Some((deadline, timeout_cfg)) = startup_deadline
-                    && Instant::now() >= deadline
-                    && startup_timeout_should_terminate(Some(pty.is_interactive()))
-                {
-                    notify_startup_termination_for_child(
-                        timeout_cfg,
-                        pty.has_visible_output(),
-                        Some(pty),
-                    );
-                    *killed_by_timeout = true;
-                    let _ = signal::kill(child, Signal::SIGKILL);
-                    let status = wait_for_child(child)?;
-                    return Ok(status);
-                }
-                continue;
-            }
+            Ok(WaitStatus::StillAlive) => continue,
             Ok(WaitStatus::Stopped(_, sig)) => {
                 debug!("Child stopped by signal {}, keeping supervisor alive", sig);
                 continue;
@@ -2108,10 +2023,6 @@ fn wait_for_child_with_pty(
     }
 
     wait_for_child(child)
-}
-
-fn startup_timeout_should_terminate(pty_interactive: Option<bool>) -> bool {
-    matches!(pty_interactive, Some(false))
 }
 
 /// Wait for child process, handling EINTR from signals.
@@ -2450,11 +2361,9 @@ fn run_supervisor_loop(
     child: Pid,
     sock: &mut SupervisorSocket,
     config: &SupervisorConfig<'_>,
-    startup_timeout: Option<StartupTimeoutConfig<'_>>,
     mut trust_interceptor: Option<crate::trust_intercept::TrustInterceptor>,
     mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
     url_listener: Option<&SupervisorListener>,
-    killed_by_timeout: &mut bool,
 ) -> Result<(WaitStatus, Vec<DenialRecord>, Vec<UrlDenialRecord>)> {
     // Start the macOS tool-sandbox background listener thread (no-op if tool-sandbox not active).
     #[cfg(target_os = "macos")]
@@ -2474,8 +2383,6 @@ fn run_supervisor_loop(
         url: Vec::new(),
         seen_request_ids: HashSet::new(),
     };
-    let startup_deadline = startup_timeout.map(|cfg| (Instant::now() + cfg.timeout, cfg));
-
     loop {
         let (pty_master, pty_client) = pty.as_ref().map_or((-1, -1), |p| p.poll_fds());
         let mut pfds = [
@@ -2558,22 +2465,7 @@ fn run_supervisor_loop(
         handle_pty_suspension(pty.as_deref_mut(), child);
 
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::StillAlive) => {
-                if let Some((deadline, timeout_cfg)) = startup_deadline
-                    && Instant::now() >= deadline
-                    && startup_timeout_should_terminate(pty.as_ref().map(|p| p.is_interactive()))
-                {
-                    notify_startup_termination_for_child(
-                        timeout_cfg,
-                        pty.as_ref().is_some_and(|p| p.has_visible_output()),
-                        pty.as_deref_mut(),
-                    );
-                    *killed_by_timeout = true;
-                    let _ = signal::kill(child, Signal::SIGKILL);
-                    return Ok((wait_for_child(child)?, denials.fs, denials.url));
-                }
-                continue;
-            }
+            Ok(WaitStatus::StillAlive) => continue,
             Ok(WaitStatus::Stopped(_, sig)) => {
                 debug!("Child stopped by signal {}, keeping supervisor alive", sig);
                 continue;
@@ -2663,14 +2555,12 @@ fn run_supervisor_loop(
     child: Pid,
     sock: &mut SupervisorSocket,
     config: &SupervisorConfig<'_>,
-    startup_timeout: Option<StartupTimeoutConfig<'_>>,
     seccomp_fd: Option<&OwnedFd>,
     proxy_seccomp_fd: Option<&OwnedFd>,
     initial_caps: &[supervisor_linux::InitialCapability],
     mut trust_interceptor: Option<crate::trust_intercept::TrustInterceptor>,
     mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
     url_listener: Option<&SupervisorListener>,
-    killed_by_timeout: &mut bool,
 ) -> Result<SupervisorLoopResult> {
     struct LoopTimer {
         start: Instant,
@@ -2715,8 +2605,6 @@ fn run_supervisor_loop(
     };
     let mut ipc_denials = Vec::new();
     let mut sock_fd_active = true;
-    let startup_deadline = startup_timeout.map(|cfg| (Instant::now() + cfg.timeout, cfg));
-
     loop {
         loop_timer.iterations += 1;
         let mut pfds: Vec<libc::pollfd> = vec![libc::pollfd {
@@ -2927,22 +2815,7 @@ fn run_supervisor_loop(
         }
 
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::StillAlive) => {
-                if let Some((deadline, timeout_cfg)) = startup_deadline
-                    && Instant::now() >= deadline
-                    && startup_timeout_should_terminate(pty.as_ref().map(|p| p.is_interactive()))
-                {
-                    notify_startup_termination_for_child(
-                        timeout_cfg,
-                        pty.as_ref().is_some_and(|p| p.has_visible_output()),
-                        pty.as_deref_mut(),
-                    );
-                    *killed_by_timeout = true;
-                    let _ = signal::kill(child, Signal::SIGKILL);
-                    return Ok((wait_for_child(child)?, denials.fs, ipc_denials, denials.url));
-                }
-                continue;
-            }
+            Ok(WaitStatus::StillAlive) => continue,
             Ok(WaitStatus::Stopped(_, sig)) => {
                 debug!("Child stopped by signal {}, keeping supervisor alive", sig);
                 continue;
@@ -4305,19 +4178,6 @@ mod tests {
     }
 
     #[test]
-    fn test_output_contains_tool_sandbox_policy_denial() {
-        assert!(output_contains_tool_sandbox_policy_denial(
-            "nono: tool-sandbox denied git: Command 'git' is blocked: entrypoint missing\n"
-        ));
-        assert!(output_contains_tool_sandbox_policy_denial(
-            "  nono: tool-sandbox denied ssh: Command 'ssh' is blocked: explicit_deny\n"
-        ));
-        assert!(!output_contains_tool_sandbox_policy_denial(
-            "git: fatal: could not read from remote repository\n"
-        ));
-    }
-
-    #[test]
     fn test_tool_sandbox_policy_denial_suppresses_redundant_footer() {
         assert!(should_suppress_diagnostics_for_tool_sandbox_denial(0, true));
         assert!(should_suppress_diagnostics_for_tool_sandbox_denial(1, true));
@@ -4500,28 +4360,18 @@ mod tests {
     }
 
     #[test]
-    fn test_startup_timeout_requires_noninteractive_pty() {
-        assert!(!startup_timeout_should_terminate(None));
-        assert!(!startup_timeout_should_terminate(Some(true)));
-        assert!(startup_timeout_should_terminate(Some(false)));
-    }
-
-    #[test]
     fn test_diagnostic_footer_triggers_on_successful_sandbox_violation() {
         let violations = vec![nono::SandboxViolation {
             operation: "file-read-data".to_string(),
             target: Some("/tmp/secret.txt".to_string()),
         }];
         let denials = Vec::new();
-        let observation = crate::diagnostic::ErrorObservation::default();
-
         assert!(should_print_diagnostic_footer(
             false,
             0,
             &denials,
             &[],
             &violations,
-            &observation,
         ));
         assert!(!should_print_diagnostic_footer(
             true,
@@ -4529,7 +4379,6 @@ mod tests {
             &denials,
             &[],
             &violations,
-            &observation,
         ));
     }
 
@@ -4540,22 +4389,12 @@ mod tests {
             access: nono::AccessMode::Read,
             reason: "path_not_granted".to_string(),
         }];
-        let observation = crate::diagnostic::ErrorObservation::default();
-
-        assert!(should_offer_profile_save(
-            false,
-            0,
-            &explanations,
-            &observation,
-            &[],
-            &[],
-        ));
+        assert!(should_offer_profile_save(false, 0, &explanations, &[], &[]));
     }
 
     #[test]
     fn test_profile_save_prompt_triggers_on_user_preferences_violation_with_zero_exit() {
         let explanations = Vec::new();
-        let observation = crate::diagnostic::ErrorObservation::default();
         let violations = vec![nono::SandboxViolation {
             operation: "user-preference-read".to_string(),
             target: Some("kcfpreferencesanyapplication".to_string()),
@@ -4565,7 +4404,6 @@ mod tests {
             false,
             0,
             &explanations,
-            &observation,
             &violations,
             &[],
         ));
@@ -4574,7 +4412,6 @@ mod tests {
     #[test]
     fn test_suppressed_system_service_violations_do_not_offer_profile_save() {
         let explanations = Vec::new();
-        let observation = crate::diagnostic::ErrorObservation::default();
         let violations = vec![nono::SandboxViolation {
             operation: "forbidden-exec-sugid".to_string(),
             target: None,
@@ -4587,7 +4424,6 @@ mod tests {
             false,
             0,
             &explanations,
-            &observation,
             &visible,
             &[],
         ));
@@ -4625,7 +4461,6 @@ mod tests {
         use nono::UrlDenialReason;
 
         let explanations = Vec::new();
-        let observation = crate::diagnostic::ErrorObservation::default();
         let url_denials = vec![UrlDenialRecord {
             origin: "https://accounts.google.com".to_string(),
             reason: UrlDenialReason::OriginNotAllowed,
@@ -4636,7 +4471,6 @@ mod tests {
             false,
             0,
             &explanations,
-            &observation,
             &[],
             &url_denials,
         ));
@@ -4648,9 +4482,8 @@ mod tests {
             false,
             0,
             &explanations,
-            &observation,
             &[],
-            &[],
+            &[]
         ));
     }
 
@@ -4683,24 +4516,8 @@ mod tests {
     #[test]
     fn test_profile_save_prompt_preserves_nonzero_exit_behavior() {
         let explanations = Vec::new();
-        let observation = crate::diagnostic::ErrorObservation::default();
-
-        assert!(should_offer_profile_save(
-            false,
-            1,
-            &explanations,
-            &observation,
-            &[],
-            &[],
-        ));
-        assert!(!should_offer_profile_save(
-            true,
-            1,
-            &explanations,
-            &observation,
-            &[],
-            &[],
-        ));
+        assert!(should_offer_profile_save(false, 1, &explanations, &[], &[]));
+        assert!(!should_offer_profile_save(true, 1, &explanations, &[], &[]));
     }
 
     #[test]
@@ -5005,20 +4822,17 @@ mod tests {
                     child,
                     &mut sock,
                     &sup_cfg,
-                    None, // no startup timeout
                     None, // no seccomp
                     None, // no proxy seccomp
                     &[],  // no initial caps
                     None, // no trust interceptor
                     None, // no PTY relay — this is what we're testing
                     None, // no URL listener
-                    &mut false,
                 );
 
                 #[cfg(not(target_os = "linux"))]
                 let result = run_supervisor_loop(
-                    child, &mut sock, &sup_cfg, None, // no startup timeout
-                    None, // no trust interceptor
+                    child, &mut sock, &sup_cfg, None, // no trust interceptor
                     None, // no PTY relay
                     None, // no URL listener
                     &mut false,
@@ -5129,14 +4943,12 @@ mod tests {
                     child,
                     &mut sock,
                     &sup_cfg,
-                    None, // no startup timeout
                     None, // no openat seccomp
                     None, // no proxy seccomp — V4+ Landlock handles it
                     &[],  // no initial caps
                     None, // no trust interceptor
                     None, // no PTY relay
                     None, // no URL listener
-                    &mut false,
                 );
 
                 let (status, denials, ipc_denials, _url_denials) = result

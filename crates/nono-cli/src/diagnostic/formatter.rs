@@ -82,18 +82,6 @@ pub struct ErrorObservation {
     pub network_blocked_hint: bool,
 }
 
-impl ErrorObservation {
-    #[must_use]
-    pub fn has_findings(&self) -> bool {
-        self.primary_verdict.is_some()
-            || self.blocked_protected_file.is_some()
-            || !self.path_hints.is_empty()
-            || !self.missing_paths.is_empty()
-            || self.non_sandbox_failure.is_some()
-            || self.network_blocked_hint
-    }
-}
-
 /// Execution mode for diagnostic context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticMode {
@@ -146,6 +134,7 @@ fn sanitize_for_diagnostic(s: &str) -> String {
 }
 
 /// Parse best-effort denial hints from a command's stderr output.
+#[cfg(test)]
 #[must_use]
 pub fn analyze_error_output(
     error_output: &str,
@@ -257,6 +246,7 @@ pub fn analyze_error_output(
     }
 }
 
+#[cfg(test)]
 fn detect_non_sandbox_failure_line(line: &str) -> Option<String> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -283,6 +273,7 @@ fn detect_non_sandbox_failure_line(line: &str) -> Option<String> {
     None
 }
 
+#[cfg(test)]
 fn detect_protected_file_in_error_line(
     protected_paths: &[PathBuf],
     error_line: &str,
@@ -297,6 +288,7 @@ fn detect_protected_file_in_error_line(
     None
 }
 
+#[cfg(test)]
 fn looks_like_network_denial(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     (lower.contains("network") || lower.contains("socket") || lower.contains("connect"))
@@ -307,6 +299,7 @@ fn looks_like_network_denial(line: &str) -> bool {
             || lower.contains("unreachable"))
 }
 
+#[cfg(test)]
 fn looks_like_access_denial(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     lower.contains("operation not permitted")
@@ -314,11 +307,13 @@ fn looks_like_access_denial(line: &str) -> bool {
         || lower.contains("read-only file system")
 }
 
+#[cfg(test)]
 fn looks_like_structured_access_denial_code(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     (lower.contains("eperm") || lower.contains("eacces")) && looks_like_access_denial(line)
 }
 
+#[cfg(test)]
 fn looks_like_missing_path(line: &str) -> bool {
     line.to_ascii_lowercase()
         .contains("no such file or directory")
@@ -358,6 +353,7 @@ fn format_command_succeeded_with_stderr_line() -> String {
         .to_string()
 }
 
+#[cfg(test)]
 fn extract_denied_path_from_error_line(line: &str) -> Option<PathBuf> {
     if let Some(path) = extract_path_after_syscall_word(line) {
         return Some(path);
@@ -383,6 +379,7 @@ fn extract_denied_path_from_error_line(line: &str) -> Option<PathBuf> {
     extract_path_from_segment(prefix).or_else(|| extract_path_from_segment(line))
 }
 
+#[cfg(test)]
 fn extract_path_after_syscall_word(line: &str) -> Option<PathBuf> {
     const MARKERS: &[&str] = &["mkdir", "mkdtemp", "open", "copyfile", "rename", "unlink"];
 
@@ -401,6 +398,7 @@ fn extract_path_after_syscall_word(line: &str) -> Option<PathBuf> {
     None
 }
 
+#[cfg(test)]
 fn infer_access_from_structured_syscall_line(line: &str) -> Option<AccessMode> {
     let syscall = extract_structured_string_property(line, "syscall")?;
     Some(match syscall.to_ascii_lowercase().as_str() {
@@ -410,10 +408,12 @@ fn infer_access_from_structured_syscall_line(line: &str) -> Option<AccessMode> {
     })
 }
 
+#[cfg(test)]
 fn extract_structured_path_property(line: &str) -> Option<PathBuf> {
     extract_structured_string_property(line, "path").map(PathBuf::from)
 }
 
+#[cfg(test)]
 fn extract_structured_string_property(line: &str, key: &str) -> Option<String> {
     let trimmed = line.trim();
     let after_key = trimmed
@@ -466,6 +466,7 @@ fn extract_structured_string_property(line: &str, key: &str) -> Option<String> {
     Some(value.to_string())
 }
 
+#[cfg(test)]
 fn extract_relative_write_path_from_line(line: &str, current_dir: &Path) -> Option<PathBuf> {
     let lower = line.to_ascii_lowercase();
     let markers = ["creating empty ", "creating ", "create ", "writing "];
@@ -495,6 +496,7 @@ fn extract_relative_write_path_from_line(line: &str, current_dir: &Path) -> Opti
     Some(current_dir.join(candidate))
 }
 
+#[cfg(test)]
 fn extract_path_from_segment(segment: &str) -> Option<PathBuf> {
     let trimmed = segment.trim();
     if trimmed.is_empty() {
@@ -538,6 +540,7 @@ fn extract_path_from_segment(segment: &str) -> Option<PathBuf> {
     Some(PathBuf::from(candidate))
 }
 
+#[cfg(test)]
 fn infer_access_from_error_line(line: &str, path: &Path) -> AccessMode {
     let lower = line.to_ascii_lowercase();
 
@@ -643,6 +646,7 @@ impl<'a> DiagnosticFormatter<'a> {
     /// Create a new formatter for the given capability set.
     #[must_use]
     pub fn new(caps: &'a CapabilitySet) -> Self {
+        let error_observation = ErrorObservation::default();
         Self {
             caps,
             mode: DiagnosticMode::Standard,
@@ -650,12 +654,12 @@ impl<'a> DiagnosticFormatter<'a> {
             ipc_denials: &[],
             sandbox_violations: &[],
             protected_paths: &[],
-            primary_verdict: None,
-            blocked_protected_file: None,
-            observed_path_hints: Vec::new(),
-            missing_path_hints: Vec::new(),
-            non_sandbox_failure: None,
-            network_blocked_hint: false,
+            primary_verdict: error_observation.primary_verdict,
+            blocked_protected_file: error_observation.blocked_protected_file,
+            observed_path_hints: error_observation.path_hints,
+            missing_path_hints: error_observation.missing_paths,
+            non_sandbox_failure: error_observation.non_sandbox_failure,
+            network_blocked_hint: error_observation.network_blocked_hint,
             command: None,
             current_dir: None,
             session_id: None,
@@ -821,6 +825,7 @@ impl<'a> DiagnosticFormatter<'a> {
     }
 
     /// Set best-effort observations extracted from the command's stderr output.
+    #[cfg(test)]
     #[must_use]
     pub fn with_error_observation(mut self, observation: ErrorObservation) -> Self {
         self.primary_verdict = observation.primary_verdict;
@@ -2441,6 +2446,7 @@ fn stderr_network_diagnostic(diagnostics: &[NonoDiagnostic]) -> Option<&NonoDiag
         .find(|diagnostic| diagnostic.code == NonoDiagnosticCode::SandboxDeniedNetwork)
 }
 
+#[cfg(test)]
 fn merge_access_modes(existing: AccessMode, new: AccessMode) -> AccessMode {
     if existing == new {
         existing

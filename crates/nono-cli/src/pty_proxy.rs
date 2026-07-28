@@ -11,15 +11,12 @@
 use nix::libc;
 use nix::pty::{OpenptyResult, Winsize, openpty};
 use nono::{NonoError, Result};
-use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 use crate::timeouts;
 
-const SCROLLBACK_LIMIT_BYTES: usize = 8 * 1024 * 1024;
-const VT_SCROLLBACK_ROWS: usize = 10_000;
 const MAX_ENHANCED_KEY_SEQUENCE_LEN: usize = 32;
 // Composed terminal escape sequences. Each concat! block documents its
 // individual CSI sequences inline so the byte-level intent is auditable
@@ -134,7 +131,7 @@ impl ScreenState {
         let rows = rows.max(1).min(u16::MAX as usize) as u16;
         let cols = cols.max(1).min(u16::MAX as usize) as u16;
         Self {
-            parser: vt100::Parser::new(rows, cols, VT_SCROLLBACK_ROWS),
+            parser: vt100::Parser::new(rows, cols, 0),
         }
     }
 
@@ -144,10 +141,6 @@ impl ScreenState {
 
     fn render(&self) -> Vec<u8> {
         self.parser.screen().state_formatted()
-    }
-
-    fn render_plaintext(&self) -> String {
-        self.parser.screen().contents()
     }
 
     fn cursor_position(&self) -> (u16, u16) {
@@ -169,9 +162,7 @@ pub struct PtyProxy {
     terminal_active: bool,
     /// Saved terminal settings.
     pub(crate) saved_termios: Option<nix::sys::termios::Termios>,
-    /// Recent PTY output retained for diagnostics.
-    scrollback: VecDeque<u8>,
-    /// Last visible screen state for diagnostics and job-control restoration.
+    /// Last visible screen state for job-control restoration.
     screen: ScreenState,
     /// Buffered enhanced key report bytes for Ctrl-Z handling.
     pending_key_escape: Vec<u8>,
@@ -269,7 +260,6 @@ impl PtyProxy {
             stdin_active: true,
             terminal_active: true,
             saved_termios: set_terminal_raw(),
-            scrollback: VecDeque::with_capacity(SCROLLBACK_LIMIT_BYTES.min(64 * 1024)),
             screen: ScreenState::new(winsize.ws_row as usize, winsize.ws_col as usize),
             pending_key_escape: Vec::new(),
             suspension_requested: false,
@@ -334,7 +324,7 @@ impl PtyProxy {
     pub(crate) fn reenter_screen_for_resume(&self) {
         if self.screen.alternate_screen_active() {
             let _ = write_all_fd(libc::STDOUT_FILENO, ALT_SCREEN_RESTORE_ESCAPE);
-            let _ = write_all_fd(libc::STDOUT_FILENO, &self.scrollback_snapshot());
+            let _ = write_all_fd(libc::STDOUT_FILENO, &self.screen_snapshot());
             drain_terminal_output(libc::STDOUT_FILENO);
         }
     }
@@ -485,17 +475,6 @@ impl PtyProxy {
         std::mem::take(&mut self.suspension_requested)
     }
 
-    /// Restore the local terminal before printing a startup diagnostic.
-    pub fn release_terminal_for_startup_diagnostic(&mut self) -> bool {
-        if self.terminal_active {
-            leave_child_screen(self.screen.alternate_screen_active());
-            self.restore_terminal();
-            true
-        } else {
-            false
-        }
-    }
-
     /// Restore terminal settings.
     pub(crate) fn restore_terminal(&mut self) {
         if let Some(ref termios) = self.saved_termios {
@@ -509,74 +488,11 @@ impl PtyProxy {
     }
 
     fn record_output(&mut self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-
-        let first_output = self.scrollback.is_empty();
         self.screen.apply_bytes(bytes);
-
-        if bytes.len() >= SCROLLBACK_LIMIT_BYTES {
-            self.scrollback.clear();
-            self.scrollback.extend(
-                bytes[bytes.len() - SCROLLBACK_LIMIT_BYTES..]
-                    .iter()
-                    .copied(),
-            );
-            return;
-        }
-
-        let overflow = self
-            .scrollback
-            .len()
-            .saturating_add(bytes.len())
-            .saturating_sub(SCROLLBACK_LIMIT_BYTES);
-        if overflow > 0 {
-            drop(self.scrollback.drain(..overflow));
-        }
-        self.scrollback.extend(bytes.iter().copied());
-        let _ = first_output;
     }
 
-    fn scrollback_snapshot(&self) -> Vec<u8> {
+    fn screen_snapshot(&self) -> Vec<u8> {
         self.screen.render()
-    }
-
-    /// Return captured terminal output as plain text for diagnostic analysis.
-    ///
-    /// Called after the child exits so the supervisor can search for
-    /// sandbox-related error messages in the terminal output.
-    pub fn screen_plaintext(&self) -> String {
-        let mut captured = Vec::with_capacity(self.scrollback.len());
-        captured.extend(self.scrollback.iter().copied());
-        let scrollback = String::from_utf8_lossy(&captured).into_owned();
-        let screen = self.screen.render_plaintext();
-
-        if scrollback.trim().is_empty() {
-            return screen;
-        }
-
-        if screen.trim().is_empty() || scrollback.contains(screen.trim_end()) {
-            return scrollback;
-        }
-
-        format!("{scrollback}\n{screen}")
-    }
-
-    /// Returns true once the child has rendered visible terminal content.
-    pub fn has_visible_output(&self) -> bool {
-        self.screen
-            .render_plaintext()
-            .chars()
-            .any(|ch| !ch.is_whitespace())
-    }
-
-    /// Returns true once the child appears interactive: either it has entered
-    /// alt-screen (TUI) or it has written visible non-whitespace output (REPL,
-    /// shell, readline prompt). Both signals mean the process is running and
-    /// the startup-timeout should not fire.
-    pub fn is_interactive(&self) -> bool {
-        self.screen.alternate_screen_active() || self.has_visible_output()
     }
 
     fn filter_client_input(&mut self, bytes: &[u8]) -> Vec<u8> {
@@ -969,7 +885,6 @@ fn wait_for_fd_writable(fd: RawFd) -> std::io::Result<()> {
 mod tests {
     use super::{PtyProxy, ScreenState};
     use nix::pty::openpty;
-    use std::collections::VecDeque;
 
     fn test_proxy() -> PtyProxy {
         let pair = openpty(None, None).expect("openpty");
@@ -978,18 +893,10 @@ mod tests {
             stdin_active: true,
             terminal_active: false,
             saved_termios: None,
-            scrollback: VecDeque::new(),
             screen: ScreenState::new(24, 80),
             pending_key_escape: Vec::new(),
             suspension_requested: false,
         }
-    }
-
-    #[test]
-    fn screen_plaintext_includes_raw_scrollback_for_diagnostics() {
-        let mut proxy = test_proxy();
-        proxy.record_output(b"permission denied\r\n");
-        assert!(proxy.screen_plaintext().contains("permission denied"));
     }
 
     #[test]

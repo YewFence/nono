@@ -1,11 +1,11 @@
 use crate::command_display::format_command_line;
-use crate::diagnostic::{ErrorObservation, PolicyExplanation};
+use crate::diagnostic::PolicyExplanation;
 use crate::exec_strategy::ProfileSaveOffer;
 use crate::theme;
 use crate::{profile, query_ext};
 use colored::Colorize;
 use nono::SandboxViolation;
-use nono::{AccessMode, CapabilitySet, NonoError, Result, UrlDenialReason, UrlDenialRecord};
+use nono::{AccessMode, NonoError, Result, UrlDenialReason, UrlDenialRecord};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -237,8 +237,6 @@ pub(crate) fn offer_save_run_profile(offer: &ProfileSaveOffer<'_>) -> Result<()>
 
     let Some(mut patch) = build_run_profile_patch(
         offer.policy_explanations,
-        offer.error_observation,
-        offer.caps,
         offer.sandbox_violations,
         offer.ignored_denial_paths,
     )?
@@ -1629,8 +1627,6 @@ fn read_input_line() -> Result<String> {
 
 fn build_run_profile_patch(
     policy_explanations: &[PolicyExplanation],
-    error_observation: &ErrorObservation,
-    caps: &CapabilitySet,
     sandbox_violations: &[SandboxViolation],
     ignored_denial_paths: &[PathBuf],
 ) -> Result<Option<profile::Profile>> {
@@ -1644,26 +1640,6 @@ fn build_run_profile_patch(
             &explanation.reason,
             ignored_denial_paths,
         );
-    }
-
-    for hint in &error_observation.path_hints {
-        match query_ext::query_path(&hint.path, hint.access, caps, &[]) {
-            Ok(query_ext::QueryResult::Denied { reason, .. })
-                if matches!(
-                    reason.as_str(),
-                    "sensitive_path" | "insufficient_access" | "path_not_granted"
-                ) =>
-            {
-                add_patch_grant(
-                    &mut grants,
-                    &hint.path,
-                    hint.access,
-                    &reason,
-                    ignored_denial_paths,
-                );
-            }
-            _ => {}
-        }
     }
 
     let unsafe_rules = unsafe_seatbelt_rules_from_sandbox_violations(sandbox_violations);
@@ -1959,15 +1935,9 @@ mod tests {
             reason: "sensitive_path".to_string(),
         };
 
-        let patch = build_run_profile_patch(
-            &[explanation],
-            &ErrorObservation::default(),
-            &CapabilitySet::new(),
-            &[],
-            &[],
-        )
-        .expect("build patch")
-        .expect("patch");
+        let patch = build_run_profile_patch(&[explanation], &[], &[])
+            .expect("build patch")
+            .expect("patch");
 
         assert_eq!(patch.filesystem.read_file, vec!["~/.claude/settings.json"]);
         assert_eq!(
@@ -1996,15 +1966,9 @@ mod tests {
             reason: "insufficient_access".to_string(),
         };
 
-        let patch = build_run_profile_patch(
-            &[read, write],
-            &ErrorObservation::default(),
-            &CapabilitySet::new(),
-            &[],
-            &[],
-        )
-        .expect("build patch")
-        .expect("patch");
+        let patch = build_run_profile_patch(&[read, write], &[], &[])
+            .expect("build patch")
+            .expect("patch");
 
         assert_eq!(patch.filesystem.allow_file, vec!["~/config.json"]);
         assert!(patch.filesystem.read_file.is_empty());
@@ -2036,8 +2000,6 @@ mod tests {
 
         let patch = build_run_profile_patch(
             &[ignored_explanation, saved_explanation],
-            &ErrorObservation::default(),
-            &CapabilitySet::new(),
             &[],
             &[nono::try_canonicalize(&ignored)],
         )
@@ -2063,14 +2025,9 @@ mod tests {
             reason: "path_not_granted".to_string(),
         };
 
-        let patch = build_run_profile_patch(
-            &[explanation],
-            &ErrorObservation::default(),
-            &CapabilitySet::new(),
-            &[],
-            &[nono::try_canonicalize(&target)],
-        )
-        .expect("build patch");
+        let patch =
+            build_run_profile_patch(&[explanation], &[], &[nono::try_canonicalize(&target)])
+                .expect("build patch");
 
         assert!(patch.is_none());
     }
@@ -2150,15 +2107,9 @@ mod tests {
             target: Some("kcfpreferencesanyapplication".to_string()),
         }];
 
-        let patch = build_run_profile_patch(
-            &[],
-            &ErrorObservation::default(),
-            &CapabilitySet::new(),
-            &violations,
-            &[],
-        )
-        .expect("build patch")
-        .expect("patch");
+        let patch = build_run_profile_patch(&[], &violations, &[])
+            .expect("build patch")
+            .expect("patch");
 
         assert_eq!(
             patch.unsafe_macos_seatbelt_rules,
