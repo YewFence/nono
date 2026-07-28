@@ -477,7 +477,6 @@ mod tests {
             argv: argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
             env: vec![],
             cwd: b"/".to_vec(),
-            stdio_tty: [false; 3],
         }
     }
 

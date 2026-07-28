@@ -811,11 +811,6 @@ fn run_shim() -> Result<()> {
         argv,
         env,
         cwd,
-        stdio_tty: [
-            is_tty(libc::STDIN_FILENO),
-            is_tty(libc::STDOUT_FILENO),
-            is_tty(libc::STDERR_FILENO),
-        ],
     };
     validate_ipc_request(&request)?;
 
@@ -873,25 +868,6 @@ fn run_child_launcher() -> Result<()> {
         start_parse.elapsed(),
         bytes.len()
     );
-    match spec.stdio_mode.as_str() {
-        "pty" => unsafe {
-            crate::pty_proxy::setup_child_pty(libc::STDIN_FILENO);
-        },
-        "direct_fds" => {
-            let result = unsafe { libc::setpgid(0, 0) };
-            if result != 0 {
-                return Err(NonoError::SandboxInit(format!(
-                    "tool-sandbox direct_fds setpgid failed: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
-        }
-        other => {
-            return Err(NonoError::ConfigParse(format!(
-                "invalid tool-sandbox stdio mode '{other}'"
-            )));
-        }
-    }
     let real_binary = OsString::from_vec(spec.real_binary.clone());
     let cwd = OsString::from_vec(spec.cwd.clone());
     std::env::set_current_dir(&cwd).map_err(|err| {
@@ -2386,6 +2362,11 @@ fn record_command_policy_audit_with_stdio(
     let Some(recorder) = recorder else {
         return Ok(());
     };
+    let stdio_mode = if stdio.is_some() {
+        "brokered"
+    } else {
+        "direct_fds"
+    };
     let event = CommandPolicyAuditEvent {
         timestamp: chrono::Utc::now().to_rfc3339(),
         session_id: Some(session_id.to_string()),
@@ -2400,7 +2381,7 @@ fn record_command_policy_audit_with_stdio(
         session_root_pid: Some(session_root_pid),
         decision: decision.to_string(),
         reason,
-        stdio_mode: selected_stdio_mode(request).to_string(),
+        stdio_mode: stdio_mode.to_string(),
         argv_hash: hash_byte_fields(&request.argv),
         env_name_hash: hash_env_names(&request.env),
         cwd_hash: hash_bytes(&request.cwd),
@@ -3442,7 +3423,6 @@ fn build_child_launch_spec_for_binary(
         )?,
         env,
         cwd: cwd.as_os_str().as_bytes().to_vec(),
-        stdio_mode: selected_stdio_mode(request).to_string(),
         stdio_limits: stdio_limits_from_policy(policy),
         caps: caps_to_spec(&caps),
         allowed_exec_paths,
@@ -4218,20 +4198,8 @@ fn launch_child(
     let spec_path = write_launch_spec(&state.runtime_dir, &spec)?;
     tool_sandbox_profile_log!("launch_child:write_spec: {:?}", start_write.elapsed());
     let start_spawn_wait = std::time::Instant::now();
-    let result = match spec.stdio_mode.as_str() {
-        "pty" => launch_child_with_pty(state, command_name, launch_caller, &spec_path, stdio),
-        "direct_fds" => launch_child_with_direct_fds(
-            state,
-            command_name,
-            launch_caller,
-            &spec_path,
-            &spec,
-            stdio,
-        ),
-        other => Err(NonoError::ConfigParse(format!(
-            "invalid tool-sandbox stdio mode '{other}'"
-        ))),
-    };
+    let result =
+        launch_child_with_direct_fds(state, command_name, launch_caller, &spec_path, &spec, stdio);
     tool_sandbox_profile_log!(
         "launch_child:spawn_and_wait: {:?}",
         start_spawn_wait.elapsed()
@@ -4595,42 +4563,6 @@ fn launch_child_with_capture(
     Ok((exit_status_code(status?), captured))
 }
 
-fn launch_child_with_pty(
-    state: &ToolSandboxState,
-    command_name: &str,
-    launch_caller: &Caller,
-    spec_path: &Path,
-    stdio: StdioFds,
-) -> Result<ChildLaunchResult> {
-    let pty = crate::pty_proxy::open_pty()?;
-    let stdin_slave = nix::unistd::dup(&pty.slave).map_err(|err| {
-        NonoError::SandboxInit(format!("tool-sandbox PTY dup stdin failed: {err}"))
-    })?;
-    let stdout_slave = nix::unistd::dup(&pty.slave).map_err(|err| {
-        NonoError::SandboxInit(format!("tool-sandbox PTY dup stdout failed: {err}"))
-    })?;
-    let stderr_slave = nix::unistd::dup(&pty.slave).map_err(|err| {
-        NonoError::SandboxInit(format!("tool-sandbox PTY dup stderr failed: {err}"))
-    })?;
-    let mut command = prepare_launcher_command(spec_path)?;
-    command
-        .stdin(Stdio::from(File::from(stdin_slave)))
-        .stdout(Stdio::from(File::from(stdout_slave)))
-        .stderr(Stdio::from(File::from(stderr_slave)));
-    install_lineage_attach(state, command_name, &mut command)?;
-    let mut child = command.spawn().map_err(NonoError::CommandExecution)?;
-    drop(command);
-    drop(pty.slave);
-    track_spawned_child(state, command_name, launch_caller, &mut child)?;
-    let status = relay_pty_and_wait(&mut child, pty.master, stdio);
-    untrack_child(state, child.id())?;
-    Ok(ChildLaunchResult {
-        exit_code: status?,
-        stdio: None,
-        blocked_reason: None,
-    })
-}
-
 fn wait_for_tracked_child(
     state: &ToolSandboxState,
     command_name: &str,
@@ -4707,197 +4639,6 @@ fn open_pidfd(pid: u32) -> Result<OwnedFd> {
     )))
 }
 
-fn relay_pty_and_wait(child: &mut Child, master: OwnedFd, stdio: StdioFds) -> Result<i32> {
-    let master_fd = master.as_raw_fd();
-    let stdin_fd = stdio.stdin.as_raw_fd();
-    let stdout_fd = stdio.stdout.as_raw_fd();
-    let _raw_guard = TerminalRawGuard::enter(stdin_fd);
-    set_nonblocking_fd(master_fd)?;
-    let mut stdin_active = true;
-    let mut master_active = true;
-    let mut last_winsize = None;
-
-    loop {
-        apply_terminal_winsize(stdin_fd, master_fd, &mut last_winsize);
-        let mut pfds = [
-            libc::pollfd {
-                fd: if stdin_active { stdin_fd } else { -1 },
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: if master_active { master_fd } else { -1 },
-                events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
-                revents: 0,
-            },
-        ];
-        let poll_status = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as _, 50) };
-        if poll_status < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() != std::io::ErrorKind::Interrupted {
-                return Err(NonoError::SandboxInit(format!(
-                    "tool-sandbox PTY poll failed: {err}"
-                )));
-            }
-        } else if poll_status > 0 {
-            if stdin_active && pfds[0].revents & libc::POLLIN != 0 {
-                match read_fd(stdin_fd)? {
-                    Some(bytes) if bytes.is_empty() => stdin_active = false,
-                    Some(bytes) => write_all_fd(master_fd, &bytes)?,
-                    None => {}
-                }
-            }
-            if master_active && pfds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-                match read_fd(master_fd)? {
-                    Some(bytes) if bytes.is_empty() => master_active = false,
-                    Some(bytes) => write_all_fd(stdout_fd, &bytes)?,
-                    None => {}
-                }
-            }
-        }
-
-        if let Some(status) = child.try_wait().map_err(NonoError::CommandExecution)? {
-            drain_pty(master_fd, stdout_fd)?;
-            return Ok(exit_status_code(status));
-        }
-    }
-}
-
-struct TerminalRawGuard {
-    fd: i32,
-    original: libc::termios,
-    original_flags: i32,
-    active: bool,
-}
-
-impl TerminalRawGuard {
-    fn enter(fd: i32) -> Option<Self> {
-        if !is_tty(fd) {
-            return None;
-        }
-        let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
-        if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
-            return None;
-        }
-        let original_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if original_flags < 0 {
-            return None;
-        }
-        let original = termios;
-        unsafe {
-            libc::cfmakeraw(&mut termios);
-        }
-        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) } != 0 {
-            return None;
-        }
-        Some(Self {
-            fd,
-            original,
-            original_flags,
-            active: true,
-        })
-    }
-}
-
-impl Drop for TerminalRawGuard {
-    fn drop(&mut self) {
-        if self.active {
-            unsafe {
-                libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
-                libc::fcntl(self.fd, libc::F_SETFL, self.original_flags);
-            }
-        }
-    }
-}
-
-fn drain_pty(master_fd: i32, stdout_fd: i32) -> Result<()> {
-    for _ in 0..16 {
-        match read_fd(master_fd)? {
-            Some(bytes) if bytes.is_empty() => break,
-            Some(bytes) => write_all_fd(stdout_fd, &bytes)?,
-            None => break,
-        }
-    }
-    Ok(())
-}
-
-fn read_fd(fd: i32) -> Result<Option<Vec<u8>>> {
-    let mut buf = [0_u8; 8192];
-    loop {
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-        if n > 0 {
-            return Ok(Some(buf[..n as usize].to_vec()));
-        }
-        if n == 0 {
-            return Ok(Some(Vec::new()));
-        }
-        let err = std::io::Error::last_os_error();
-        match err.kind() {
-            std::io::ErrorKind::Interrupted => continue,
-            std::io::ErrorKind::WouldBlock => return Ok(None),
-            _ if err.raw_os_error() == Some(libc::EIO) => return Ok(Some(Vec::new())),
-            _ => {
-                return Err(NonoError::SandboxInit(format!(
-                    "tool-sandbox PTY fd read failed: {err}"
-                )));
-            }
-        }
-    }
-}
-
-fn write_all_fd(fd: i32, mut bytes: &[u8]) -> Result<()> {
-    while !bytes.is_empty() {
-        let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
-        if n > 0 {
-            bytes = &bytes[n as usize..];
-            continue;
-        }
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox PTY fd write failed: {err}"
-        )));
-    }
-    Ok(())
-}
-
-fn set_nonblocking_fd(fd: i32) -> Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox fcntl(F_GETFL) failed: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } != 0 {
-        return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox fcntl(F_SETFL) failed: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    Ok(())
-}
-
-fn apply_terminal_winsize(stdin_fd: i32, pty_master_fd: i32, last: &mut Option<(u16, u16)>) {
-    let mut ws = unsafe { std::mem::zeroed::<libc::winsize>() };
-    if unsafe { libc::ioctl(stdin_fd, libc::TIOCGWINSZ, &mut ws) } != 0 {
-        return;
-    }
-    if ws.ws_row == 0 || ws.ws_col == 0 {
-        return;
-    }
-    let current = (ws.ws_row, ws.ws_col);
-    if *last == Some(current) {
-        return;
-    }
-    unsafe {
-        libc::ioctl(pty_master_fd, libc::TIOCSWINSZ, &ws);
-    }
-    *last = Some(current);
-}
-
 fn verify_binary_identity(binary: &ResolvedCommandBinary) -> Result<()> {
     let metadata =
         fs::metadata(&binary.canonical_path).map_err(|source| NonoError::ConfigRead {
@@ -4968,18 +4709,6 @@ fn check_exec_gate(
         }
     }
     None
-}
-
-fn is_tty(fd: i32) -> bool {
-    unsafe { libc::isatty(fd) == 1 }
-}
-
-fn selected_stdio_mode(request: &ToolSandboxShimRequest) -> &'static str {
-    if request.stdio_tty.iter().all(|value| *value) {
-        "pty"
-    } else {
-        "direct_fds"
-    }
 }
 
 fn caps_to_spec(caps: &CapabilitySet) -> ChildCapsSpec {
@@ -5640,25 +5369,6 @@ mod tests {
 
         assert!(!runtime.exists(), "sealed runtime dir was not removed");
         Ok(())
-    }
-
-    #[test]
-    fn non_tty_stdio_uses_direct_fds() {
-        for stdio_tty in [
-            [false, false, false],
-            [true, false, false],
-            [false, true, false],
-            [false, false, true],
-        ] {
-            let request = ToolSandboxShimRequest {
-                command: "cmd".to_string(),
-                argv: vec![b"cmd".to_vec()],
-                env: Vec::new(),
-                cwd: b"/tmp".to_vec(),
-                stdio_tty,
-            };
-            assert_eq!(selected_stdio_mode(&request), "direct_fds");
-        }
     }
 
     fn create_dir(path: &Path) -> Result<()> {

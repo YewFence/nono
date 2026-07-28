@@ -653,11 +653,6 @@ fn run_shim() -> Result<()> {
         argv,
         env,
         cwd,
-        stdio_tty: [
-            is_tty(libc::STDIN_FILENO),
-            is_tty(libc::STDOUT_FILENO),
-            is_tty(libc::STDERR_FILENO),
-        ],
     };
     validate_ipc_request(&request)?;
 
@@ -702,13 +697,6 @@ fn run_child_launcher() -> Result<()> {
     let spec: ToolSandboxChildLaunchSpec = serde_json::from_slice(&bytes).map_err(|err| {
         NonoError::ConfigParse(format!("failed to parse tool-sandbox launch spec: {err}"))
     })?;
-    if spec.stdio_mode != "direct_fds" {
-        return Err(NonoError::ConfigParse(format!(
-            "invalid tool-sandbox stdio mode '{}'",
-            spec.stdio_mode
-        )));
-    }
-
     let real_binary = OsString::from_vec(spec.real_binary.clone());
     let cwd = OsString::from_vec(spec.cwd.clone());
     std::env::set_current_dir(&cwd).map_err(|err| {
@@ -2588,7 +2576,6 @@ fn build_child_launch_spec_for_binary(
         )?,
         env: filter_child_env(state, request, policy, caller)?,
         cwd: cwd.as_os_str().as_bytes().to_vec(),
-        stdio_mode: selected_stdio_mode(request).to_string(),
         stdio_limits: stdio_limits_from_policy(policy),
         caps: caps_to_spec(&caps),
         allowed_exec_paths: Vec::new(),
@@ -3819,10 +3806,6 @@ fn mtime_nanos(metadata: &fs::Metadata) -> i128 {
     secs.saturating_mul(1_000_000_000).saturating_add(nanos)
 }
 
-fn selected_stdio_mode(_request: &ToolSandboxShimRequest) -> &'static str {
-    "direct_fds"
-}
-
 fn caps_to_spec(caps: &CapabilitySet) -> ChildCapsSpec {
     ChildCapsSpec {
         fs: caps
@@ -4159,6 +4142,11 @@ fn record_command_policy_audit_with_stdio(
     let Some(recorder) = recorder else {
         return Ok(());
     };
+    let stdio_mode = if stdio.is_some() {
+        "brokered"
+    } else {
+        "direct_fds"
+    };
     let event = CommandPolicyAuditEvent {
         timestamp: chrono::Utc::now().to_rfc3339(),
         session_id: Some(session_id.to_string()),
@@ -4173,7 +4161,7 @@ fn record_command_policy_audit_with_stdio(
         session_root_pid: Some(session_root_pid),
         decision: decision.to_string(),
         reason,
-        stdio_mode: selected_stdio_mode(request).to_string(),
+        stdio_mode: stdio_mode.to_string(),
         argv_hash: hash_byte_fields(&request.argv),
         env_name_hash: hash_env_names(&request.env),
         cwd_hash: hash_bytes(&request.cwd),
@@ -4914,11 +4902,6 @@ fn validate_platform_requirements(_config: &CommandPoliciesConfig) -> Result<()>
 
 // ── IPC framing ───────────────────────────────────────────────────────────
 
-fn is_tty(fd: i32) -> bool {
-    // SAFETY: isatty is async-signal-safe and always returns 0 or 1.
-    unsafe { libc::isatty(fd) != 0 }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5005,7 +4988,6 @@ mod tests {
             argv: vec![b"git".to_vec()],
             env,
             cwd: b"/tmp".to_vec(),
-            stdio_tty: [false; 3],
         }
     }
 
@@ -5026,7 +5008,6 @@ mod tests {
                 b"OPENAI_API_KEY=provider-secret".to_vec(),
             ],
             cwd: b"/tmp/work".to_vec(),
-            stdio_tty: [false; 3],
         };
 
         record_command_policy_audit(
@@ -6235,12 +6216,6 @@ mod tests {
 
         assert!(!runtime.exists(), "sealed runtime dir was not removed");
         Ok(())
-    }
-
-    #[test]
-    fn selected_stdio_mode_uses_supervisor_direct_fds() {
-        let request = request_with_env(Vec::new());
-        assert_eq!(selected_stdio_mode(&request), "direct_fds");
     }
 
     #[test]

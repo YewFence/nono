@@ -51,7 +51,6 @@ pub(crate) struct ToolSandboxShimRequest {
     pub(crate) argv: Vec<Vec<u8>>,
     pub(crate) env: Vec<Vec<u8>>,
     pub(crate) cwd: Vec<u8>,
-    pub(crate) stdio_tty: [bool; 3],
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -92,7 +91,6 @@ pub(crate) struct ToolSandboxChildLaunchSpec {
     pub(crate) argv: Vec<Vec<u8>>,
     pub(crate) env: Vec<Vec<u8>>,
     pub(crate) cwd: Vec<u8>,
-    pub(crate) stdio_mode: String,
     pub(crate) stdio_limits: Option<StdioLimitSpec>,
     pub(crate) caps: ChildCapsSpec,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

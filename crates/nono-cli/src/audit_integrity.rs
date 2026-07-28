@@ -200,7 +200,7 @@ mod tests {
                 session_root_pid: Some(41),
                 decision: "denied".to_string(),
                 reason: Some("entrypoint missing".to_string()),
-                stdio_mode: "pty".to_string(),
+                stdio_mode: "direct_fds".to_string(),
                 argv_hash: "argv-hash".to_string(),
                 env_name_hash: "env-hash".to_string(),
                 cwd_hash: "cwd-hash".to_string(),
