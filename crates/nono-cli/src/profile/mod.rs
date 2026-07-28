@@ -2078,7 +2078,7 @@ pub struct SecurityConfig {
     /// Enable runtime capability elevation via seccomp-notify (Linux).
     /// When true, the supervisor intercepts file opens and can grant access
     /// to paths not in the initial capability set. When false (default),
-    /// the sandbox is static — no seccomp interception, no PTY mux, no prompts.
+    /// the sandbox is static — no seccomp interception or runtime prompts.
     #[serde(default)]
     pub capability_elevation: Option<bool>,
     /// WSL2 proxy fallback policy. Controls behavior when ProxyOnly network

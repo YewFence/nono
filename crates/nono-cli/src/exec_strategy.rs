@@ -439,8 +439,7 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
 /// 4. Child: apply Landlock, install seccomp-notify, close inherited FDs, exec
 /// 5. Parent: apply PR_SET_DUMPABLE(0) + PT_DENY_ATTACH, receive seccomp fd, run supervisor loop
 ///
-/// When a PTY pair is provided, the child runs behind the PTY proxy so it sees a
-/// TTY. Otherwise the child inherits the parent's terminal directly.
+/// The child inherits the parent's standard file descriptors directly.
 /// The parent prints diagnostics and rollback UI after the child exits.
 ///
 /// Append `set_vars` to a raw `execve` environment vector, deduplicating by key.
@@ -4436,10 +4435,10 @@ mod tests {
 
     /// Verify that the supervisor loop runs and exits cleanly with inherited stdio.
     ///
-    /// This tests the `capability_elevation = false` code path where no PTY is
-    /// allocated but the supervisor loop must still service the IPC socket for
-    /// trust interception. The child fork closes its socket end and exits,
-    /// causing the loop to see POLLHUP and return.
+    /// This tests the `capability_elevation = false` code path where the
+    /// supervisor loop must still service the IPC socket for trust interception.
+    /// The child fork closes its socket end and exits, causing the loop to see
+    /// POLLHUP and return.
     #[test]
     fn test_supervisor_loop_runs_with_inherited_stdio() {
         use std::os::unix::net::UnixStream;

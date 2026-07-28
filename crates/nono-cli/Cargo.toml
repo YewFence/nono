@@ -91,7 +91,6 @@ globset = "0.4"
 regex = "1"
 urlencoding = "2"
 tempfile.workspace = true
-vt100 = "0.16.2"
 shlex = "2"
 jsonc-parser = { version = "0.32", features = ["serde"] }
 

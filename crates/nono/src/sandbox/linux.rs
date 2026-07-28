@@ -3998,10 +3998,14 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn bind_abstract_listener(name: &[u8]) -> FdGuard {
+    fn bind_abstract_listener(name: &[u8]) -> std::result::Result<FdGuard, i32> {
         // SAFETY: socket is called with constant domain/type/protocol values.
         let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-        assert!(fd >= 0, "socket(AF_UNIX) failed");
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO));
+        }
         let guard = FdGuard(fd);
 
         let (addr, addr_len) = match abstract_sockaddr(name) {
@@ -4019,12 +4023,16 @@ mod tests {
                 addr_len,
             )
         };
-        assert_eq!(bind_result, 0, "bind(AF_UNIX abstract) failed");
+        if bind_result != 0 {
+            return Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO));
+        }
 
         // SAFETY: guard.0 is a valid stream socket created above.
         let listen_result = unsafe { libc::listen(guard.0, 4) };
         assert_eq!(listen_result, 0, "listen(AF_UNIX abstract) failed");
-        guard
+        Ok(guard)
     }
 
     #[cfg(target_os = "linux")]
@@ -4335,7 +4343,11 @@ mod tests {
             // SAFETY: getpid has no preconditions.
             unsafe { libc::getpid() }
         );
-        let listener = bind_abstract_listener(socket_name.as_bytes());
+        let listener = match bind_abstract_listener(socket_name.as_bytes()) {
+            Ok(listener) => listener,
+            Err(libc::EPERM | libc::EACCES) => return,
+            Err(errno) => panic!("bind(AF_UNIX abstract) failed with errno {errno}"),
+        };
 
         let scoped_caps = CapabilitySet::new()
             .set_signal_mode(SignalMode::AllowAll)

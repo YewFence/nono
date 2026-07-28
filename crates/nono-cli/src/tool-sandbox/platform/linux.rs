@@ -1099,7 +1099,7 @@ fn handle_url_open_stream(
 ) {
     // Bound the time a single client can hold this handler. On Linux this runs
     // on the single-threaded supervisor loop, so an idle/slow client would
-    // otherwise stall signal handling, other shims, and PTY traffic.
+    // otherwise stall signal handling and other shims.
     if stream
         .set_read_timeout(Some(TOOL_SANDBOX_URL_IO_TIMEOUT))
         .and_then(|()| stream.set_write_timeout(Some(TOOL_SANDBOX_URL_IO_TIMEOUT)))
