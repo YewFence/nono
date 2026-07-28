@@ -484,6 +484,25 @@ pub(crate) fn expand_dynamic_tokens(
 mod tests {
     use super::*;
 
+    fn tempdir_outside_git_repo() -> tempfile::TempDir {
+        for root in [std::env::temp_dir(), std::path::PathBuf::from("/var/tmp")] {
+            let Ok(tempdir) = tempfile::Builder::new()
+                .prefix("nono-outside-git-")
+                .tempdir_in(root)
+            else {
+                continue;
+            };
+            let has_git_ancestor = tempdir
+                .path()
+                .ancestors()
+                .any(|ancestor| std::fs::symlink_metadata(ancestor.join(".git")).is_ok());
+            if !has_git_ancestor {
+                return tempdir;
+            }
+        }
+        panic!("no writable temporary directory outside a Git repository");
+    }
+
     #[test]
     fn parse_token_recognises_at_provider_colon_query() {
         assert_eq!(
@@ -948,7 +967,7 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
 
     #[test]
     fn git_read_common_dir_returns_empty_outside_git_repo() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = tempdir_outside_git_repo();
         let result = git::read_common_dir_in(tmp.path()).expect("read_common_dir");
         assert!(
             result.is_empty(),
@@ -1037,7 +1056,7 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
 
     #[test]
     fn git_read_main_worktree_returns_empty_outside_git_repo() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = tempdir_outside_git_repo();
         let result = git::read_main_worktree_in(tmp.path()).expect("read_main_worktree");
         assert!(
             result.is_empty(),
@@ -1124,7 +1143,7 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
 
     #[test]
     fn git_read_toplevel_returns_empty_outside_git_repo() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = tempdir_outside_git_repo();
         let result = git::read_toplevel_in(tmp.path()).expect("read_toplevel");
         assert!(
             result.is_empty(),
@@ -1157,7 +1176,7 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
 
     #[test]
     fn git_read_toplevel_parent_returns_empty_outside_git_repo() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = tempdir_outside_git_repo();
         let result = git::read_toplevel_parent_in(tmp.path()).expect("read_toplevel_parent");
         assert!(
             result.is_empty(),

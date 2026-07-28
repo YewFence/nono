@@ -13,11 +13,79 @@
 
 use nono_test_support::{Argv, Completed, NonoTest, Profile, Sandboxed, Sandboxing, nono_test};
 use std::fs;
+use std::io::Write;
 use std::net::TcpListener;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+fn nono_bin() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_nono"))
+}
+
+fn setup_isolated_home(prefix: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let temp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("test-artifacts");
+    fs::create_dir_all(&temp_root).expect("create test-artifacts root");
+    let tmp = tempfile::Builder::new()
+        .prefix(&format!("nono-{prefix}-it-"))
+        .tempdir_in(&temp_root)
+        .expect("create tempdir");
+    let home = tmp.path().join("home");
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(home.join(".config")).expect("create .config dir");
+    fs::create_dir_all(home.join(".local").join("state")).expect("create state dir");
+    fs::create_dir_all(&workspace).expect("create workspace dir");
+    (tmp, home, workspace)
+}
+
+fn write_profile(home: &Path, name: &str, json: &str) -> PathBuf {
+    let path = home.join(format!("{name}.json"));
+    fs::write(&path, json).expect("write profile");
+    path
+}
+
+fn write_basic_profile(home: &Path, workspace: &Path, name: &str) -> PathBuf {
+    write_profile(
+        home,
+        name,
+        &format!(
+            r#"{{
+                "meta": {{ "name": "{name}" }},
+                "filesystem": {{ "allow": ["{workspace}"] }},
+                "network": {{ "block": true }}
+            }}"#,
+            workspace = workspace.display()
+        ),
+    )
+}
+
+fn isolated_nono_command(home: &Path, cwd: &Path) -> Command {
+    let mut command = nono_bin();
+    command
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_STATE_HOME", home.join(".local").join("state"))
+        .env("NONO_NO_SAVE_PROMPT", "1")
+        .env_remove("NONO_DETACHED_LAUNCH")
+        .current_dir(cwd);
+    command
+}
+
+fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
 
 fn python3_available() -> bool {
     Command::new("python3")
@@ -79,6 +147,132 @@ fn cc_available() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+#[test]
+fn supervised_non_tty_stdio_preserves_streams_eof_and_exit_code() {
+    let (_tmp, home, workspace) = setup_isolated_home("supervised-stdio");
+    let profile_path = write_basic_profile(&home, &workspace, "supervised-stdio");
+
+    let mut child = isolated_nono_command(&home, &workspace)
+        .args([
+            "--silent",
+            "run",
+            "--profile",
+            profile_path.to_str().expect("profile path"),
+            "--no-rollback",
+            "--",
+            "/bin/sh",
+            "-c",
+            "IFS= read -r line; printf 'stdout:%s' \"$line\"; printf 'stderr:%s' \"$line\" >&2; exit 37",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn supervised run");
+
+    child
+        .stdin
+        .take()
+        .expect("child stdin")
+        .write_all(b"pipe-payload\n")
+        .expect("write child stdin");
+    let output = child.wait_with_output().expect("wait for supervised run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(37), "stderr: {stderr}");
+    assert_eq!(stdout, "stdout:pipe-payload");
+    assert!(stderr.contains("stderr:pipe-payload"), "stderr: {stderr}");
+    assert!(!stdout.contains("stderr:pipe-payload"));
+}
+
+#[test]
+fn session_stop_forwards_sigterm_and_registry_tracks_exit() {
+    let (_tmp, home, workspace) = setup_isolated_home("session-stop");
+    let profile_path = write_basic_profile(&home, &workspace, "session-stop");
+    let ready_path = workspace.join("ready");
+    let term_path = workspace.join("term");
+    let sessions_dir = home.join(".local/state/nono/sessions");
+
+    let mut child = isolated_nono_command(&home, &workspace)
+        .args([
+            "--silent",
+            "run",
+            "--profile",
+            profile_path.to_str().expect("profile path"),
+            "--no-rollback",
+            "--name",
+            "phase-zero-sigterm",
+            "--",
+            "/bin/sh",
+            "-c",
+            "trap 'printf received > \"$2\"; exit 42' TERM; printf ready > \"$1\"; while :; do sleep 0.1; done",
+            "sh",
+            ready_path.to_str().expect("ready path"),
+            term_path.to_str().expect("term path"),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn managed session");
+
+    let registry_ready = wait_until(Duration::from_secs(5), || {
+        let Ok(entries) = fs::read_dir(&sessions_dir) else {
+            return false;
+        };
+        entries.filter_map(Result::ok).any(|entry| {
+            fs::read_to_string(entry.path())
+                .ok()
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+                .is_some_and(|record| {
+                    record["name"] == "phase-zero-sigterm"
+                        && record["status"] == "running"
+                        && record["child_pid"].as_u64().is_some_and(|pid| pid > 0)
+                })
+        })
+    });
+    let child_ready = wait_until(Duration::from_secs(5), || ready_path.exists());
+    if !registry_ready || !child_ready {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(registry_ready, "running session was not registered");
+    assert!(child_ready, "sandboxed child did not start");
+
+    let stop_output = isolated_nono_command(&home, &workspace)
+        .args(["--silent", "stop", "phase-zero-sigterm", "--timeout", "2"])
+        .output()
+        .expect("run nono stop");
+    let status = child.wait().expect("wait for managed session");
+    assert!(
+        stop_output.status.success(),
+        "nono stop failed: {}",
+        String::from_utf8_lossy(&stop_output.stderr)
+    );
+    assert_eq!(status.code(), Some(42));
+    assert_eq!(
+        fs::read_to_string(&term_path).expect("read SIGTERM marker"),
+        "received"
+    );
+
+    assert!(wait_until(Duration::from_secs(2), || {
+        let Ok(entries) = fs::read_dir(&sessions_dir) else {
+            return false;
+        };
+        entries.filter_map(Result::ok).any(|entry| {
+            fs::read_to_string(entry.path())
+                .ok()
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+                .is_some_and(|record| {
+                    record["name"] == "phase-zero-sigterm"
+                        && record["status"] == "exited"
+                        && record["exit_code"] == 42
+                })
+        })
+    }));
 }
 
 #[test]

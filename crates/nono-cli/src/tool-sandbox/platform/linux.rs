@@ -5641,6 +5641,25 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn non_tty_stdio_uses_direct_fds() {
+        for stdio_tty in [
+            [false, false, false],
+            [true, false, false],
+            [false, true, false],
+            [false, false, true],
+        ] {
+            let request = ToolSandboxShimRequest {
+                command: "cmd".to_string(),
+                argv: vec![b"cmd".to_vec()],
+                env: Vec::new(),
+                cwd: b"/tmp".to_vec(),
+                stdio_tty,
+            };
+            assert_eq!(selected_stdio_mode(&request), "direct_fds");
+        }
+    }
+
     fn create_dir(path: &Path) -> Result<()> {
         fs::create_dir(path).map_err(|source| NonoError::ConfigWrite {
             path: path.to_path_buf(),
