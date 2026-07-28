@@ -98,8 +98,6 @@ const MAX_CRYPTO_THREADS: usize = 12;
 const MAX_DENIAL_RECORDS: usize = 1000;
 /// Hard cap on request IDs tracked for replay detection.
 const MAX_TRACKED_REQUEST_IDS: usize = 4096;
-use crate::timeouts;
-
 pub(crate) struct ProfileSaveOffer<'a> {
     pub(crate) policy_explanations: &'a [crate::diagnostic::PolicyExplanation],
     pub(crate) command: &'a [std::ffi::OsString],
@@ -107,18 +105,6 @@ pub(crate) struct ProfileSaveOffer<'a> {
     pub(crate) sandbox_violations: &'a [nono::SandboxViolation],
     pub(crate) ignored_denial_paths: &'a [std::path::PathBuf],
     pub(crate) url_denials: &'a [UrlDenialRecord],
-}
-
-fn offer_profile_save_for_child(
-    pty: Option<&mut crate::pty_proxy::PtyProxy>,
-    offer: &ProfileSaveOffer<'_>,
-) -> Result<()> {
-    if let Some(proxy) = pty {
-        let _released_terminal = proxy.release_terminal_for_prompt();
-        return crate::profile_save_runtime::offer_save_run_profile(offer);
-    }
-
-    crate::profile_save_runtime::offer_save_run_profile(offer)
 }
 
 /// Linux procfs context for resolving child-relative procfs paths in the supervisor.
@@ -499,8 +485,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     supervisor: Option<&SupervisorConfig<'_>>,
     trust_interceptor: Option<crate::trust_intercept::TrustInterceptor>,
     on_fork: Option<&mut dyn FnMut(u32)>,
-    pty_pair: Option<crate::pty_proxy::PtyPair>,
-    pty_session_id: Option<&str>,
+    session_id: Option<&str>,
     // Write fd of the resource cgroup's `cgroup.procs`. The forked child attaches
     // itself through it before sandboxing or exec'ing. None off Linux.
     resource_procs_fd: Option<std::os::fd::RawFd>,
@@ -817,14 +802,8 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
         }
     }
 
-    // The caller prepares the PTY pair before capability elevation setup.
-    let pty_slave_fd = pty_pair.as_ref().map(|p| p.slave.as_raw_fd());
-
-    // Compute child's FD keep list: PTY slave (if elevation) + supervisor socket fd
+    // Compute the child's inherited supervisor fd keep list.
     let mut child_keep_fds: Vec<i32> = Vec::new();
-    if let Some(fd) = pty_slave_fd {
-        child_keep_fds.push(fd);
-    }
     if let Some(fd) = child_sock_fd {
         child_keep_fds.push(fd);
     }
@@ -875,8 +854,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
             #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
             let effective_caps: &CapabilitySet = config.caps;
 
-            // CHILD: Set up PTY, apply sandbox, then exec.
-            //
+            // CHILD: Apply the sandbox, then exec with inherited stdio.
             // The child applies the sandbox itself before exec.
             // Sandbox::apply_auto() allocates (Seatbelt profile generation, Landlock
             // PathFd opens) but this is safe because we validated single-threaded
@@ -902,14 +880,6 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     );
                     libc::_exit(126);
                 }
-            }
-
-            // Set up PTY slave as the child's controlling terminal (elevation only).
-            // This gives the child its own terminal so TUI apps can freely
-            // change terminal modes without affecting the supervisor.
-            // SAFETY: We are in the child after fork, slave_fd is valid.
-            if let Some(slave_fd) = pty_slave_fd {
-                unsafe { crate::pty_proxy::setup_child_pty(slave_fd) };
             }
 
             // Resource cgroup self-attach: before sandboxing or exec'ing, the child
@@ -1321,26 +1291,6 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                 callback(child.as_raw() as u32);
             }
 
-            let mut pty_proxy = if let Some(pty) = pty_pair {
-                drop(pty.slave);
-                let _session_id = pty_session_id
-                    .or_else(|| supervisor.map(|s| s.session_id))
-                    .unwrap_or("unknown");
-                match crate::pty_proxy::PtyProxy::new(pty.master) {
-                    Ok(proxy) => Some(proxy),
-                    Err(e) => {
-                        let _ = signal::kill(child, Signal::SIGKILL);
-                        let _ = waitpid(child, None);
-                        return Err(NonoError::SandboxInit(format!(
-                            "Failed to create PTY proxy: {}",
-                            e
-                        )));
-                    }
-                }
-            } else {
-                None
-            };
-
             // Destructure socket pair: close child's end, keep supervisor's end
             let supervisor_sock = if let Some((sup, child_end)) = socket_pair {
                 drop(child_end);
@@ -1492,8 +1442,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
             };
 
             // Set up signal forwarding.
-            setup_signal_forwarding(child, pty_proxy.as_ref().map(|p| p.poll_fds().0));
-            let _signal_forwarding_guard = SignalForwardingGuard;
+            let mut signal_forwarding_guard = setup_signal_forwarding(child);
 
             // NOTE: peer_pid() is NOT called here. For socketpair() created
             // before fork, LOCAL_PEERPID/SO_PEERCRED return the parent's own PID
@@ -1546,7 +1495,6 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                             proxy_notify_fd.as_ref(),
                             &initial_caps,
                             trust_interceptor,
-                            pty_proxy.as_mut(),
                             url_listener.as_ref().map(|(l, _)| l),
                         )?;
                         (status, denials, ipc_denials, url_denials)
@@ -1558,20 +1506,15 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                             &mut sup_sock,
                             sup_cfg,
                             trust_interceptor,
-                            pty_proxy.as_mut(),
                             url_listener.as_ref().map(|(l, _)| l),
                         )?;
                         (status, denials, Vec::new(), url_denials)
                     }
                 } else {
-                    let status = wait_for_child_with_pty(child, pty_proxy.as_mut())?;
+                    let status = wait_for_child(child)?;
                     (status, Vec::new(), Vec::new(), Vec::new())
                 };
-
-            if let Some(ref mut p) = pty_proxy {
-                p.drain_master_output(timeouts::pty_drain_timeout());
-                p.release_terminal_for_prompt();
-            }
+            signal_forwarding_guard.restore();
 
             let exit_code = match status {
                 WaitStatus::Exited(_, code) => {
@@ -1655,7 +1598,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
             // sandbox evidence shows a likely sandbox-related issue.
             if should_print_diagnostics || config.diagnostics_json {
                 let diag_session_id = if supervisor.is_some() {
-                    pty_session_id
+                    session_id
                         .or_else(|| supervisor.map(|s| s.session_id))
                         .map(str::to_string)
                 } else {
@@ -1727,10 +1670,6 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     &url_denials,
                 )
             {
-                // Clear the forwarding target before prompting. The child is
-                // already dead; keeping CHILD_PID set would cause forward_signal
-                // to send Ctrl-C to the dead PID, swallowing it silently.
-                clear_signal_forwarding_target();
                 let offer = ProfileSaveOffer {
                     policy_explanations: &prompt_policy_explanations,
                     command: config.command,
@@ -1739,7 +1678,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     ignored_denial_paths: config.ignored_denial_paths,
                     url_denials: &url_denials,
                 };
-                offer_profile_save_for_child(pty_proxy.as_mut(), &offer)?;
+                crate::profile_save_runtime::offer_save_run_profile(&offer)?;
             }
 
             Ok(exit_code)
@@ -1975,69 +1914,6 @@ fn get_max_fd() -> i32 {
     }
 }
 
-/// Wait for child process while proxying PTY I/O.
-fn wait_for_child_with_pty(
-    child: Pid,
-    pty: Option<&mut crate::pty_proxy::PtyProxy>,
-) -> Result<WaitStatus> {
-    let pty = match pty {
-        Some(pty) => pty,
-        None => {
-            return wait_for_child(child);
-        }
-    };
-    loop {
-        let (master_fd, client_fd) = pty.poll_fds();
-        let mut pfds = [
-            libc::pollfd {
-                fd: master_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: client_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-
-        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 2, 200) };
-
-        if ret > 0 {
-            if !handle_pty_poll_events(pty, pfds[0].revents, pfds[1].revents, "PTY wait loop") {
-                break;
-            }
-        } else if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() != std::io::ErrorKind::Interrupted {
-                warn!("poll() error in PTY wait loop: {}", err);
-                break;
-            }
-        }
-
-        handle_pty_suspension(Some(pty), child);
-
-        match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::StillAlive) => continue,
-            Ok(WaitStatus::Stopped(_, sig)) => {
-                debug!("Child stopped by signal {}, keeping supervisor alive", sig);
-                continue;
-            }
-            Ok(WaitStatus::Continued(_)) => {
-                debug!("Child continued, waiting for terminal exit");
-                continue;
-            }
-            Ok(status) => return Ok(status),
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(e) => {
-                return Err(NonoError::SandboxInit(format!("waitpid() failed: {}", e)));
-            }
-        }
-    }
-
-    wait_for_child(child)
-}
-
 /// Wait for child process, handling EINTR from signals.
 fn wait_for_child(child: Pid) -> Result<WaitStatus> {
     loop {
@@ -2056,8 +1932,9 @@ fn wait_for_child(child: Pid) -> Result<WaitStatus> {
 
 /// Set up signal forwarding from parent to child.
 ///
-/// Signals received by the parent are forwarded to the child process.
-/// This ensures Ctrl+C, SIGTERM, etc. properly reach the sandboxed command.
+/// Management signals received by the parent are forwarded to the child process.
+/// Terminal-generated signals reach both processes through their shared foreground
+/// process group and must not be forwarded a second time.
 ///
 /// # Process-Global State
 ///
@@ -2073,7 +1950,9 @@ fn wait_for_child(child: Pid) -> Result<WaitStatus> {
 /// 1. `execute_supervised` is CLI code, not library code (per DESIGN-supervisor.md)
 /// 2. The fork+wait model inherently requires single-threaded execution
 /// 3. Library consumers would use `Sandbox::apply_auto()` directly, not the fork machinery
-fn setup_signal_forwarding(child: Pid, pty_master_fd: Option<i32>) {
+const FORWARDED_MANAGEMENT_SIGNALS: [Signal; 2] = [Signal::SIGTERM, Signal::SIGHUP];
+
+fn setup_signal_forwarding(child: Pid) -> SignalForwardingGuard {
     // ==================== SAFETY INVARIANT ====================
     // This static variable is ONLY safe because execute_supervised()
     // verifies single-threaded execution BEFORE calling this function.
@@ -2092,64 +1971,31 @@ fn setup_signal_forwarding(child: Pid, pty_master_fd: Option<i32>) {
     // - The only safe option is process-global static storage
     // - AtomicI32 ensures atomic reads/writes
     CHILD_PID.store(child.as_raw(), std::sync::atomic::Ordering::SeqCst);
-    PTY_MASTER_FD.store(
-        pty_master_fd.unwrap_or(-1),
-        std::sync::atomic::Ordering::SeqCst,
-    );
-    // Install signal handlers for common signals
+    // Install handlers only for out-of-band session management signals.
     // SAFETY: signal handlers are async-signal-safe (only call kill())
+    let mut previous_handlers = Vec::with_capacity(FORWARDED_MANAGEMENT_SIGNALS.len());
     unsafe {
-        for sig in &[
-            Signal::SIGINT,
-            Signal::SIGTERM,
-            Signal::SIGHUP,
-            Signal::SIGQUIT,
-        ] {
-            if let Err(e) = signal::signal(*sig, signal::SigHandler::Handler(forward_signal)) {
-                debug!("Failed to install handler for {:?}: {}", sig, e);
+        for sig in FORWARDED_MANAGEMENT_SIGNALS {
+            match signal::signal(sig, signal::SigHandler::Handler(forward_signal)) {
+                Ok(previous) => previous_handlers.push((sig, previous)),
+                Err(e) => debug!("Failed to install handler for {:?}: {}", sig, e),
             }
         }
-
-        if pty_master_fd.is_some()
-            && let Err(e) = signal::signal(
-                Signal::SIGWINCH,
-                signal::SigHandler::Handler(forward_signal),
-            )
-        {
-            debug!("Failed to install SIGWINCH handler: {:?}", e);
-        }
     }
+    SignalForwardingGuard { previous_handlers }
 }
 
 static CHILD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-static PTY_MASTER_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 extern "C" fn forward_signal(sig: libc::c_int) {
     let child_raw = CHILD_PID.load(std::sync::atomic::Ordering::SeqCst);
     if child_raw > 0 {
-        if sig == libc::SIGWINCH {
-            let master_fd = PTY_MASTER_FD.load(std::sync::atomic::Ordering::SeqCst);
-            if master_fd >= 0 {
-                let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-                unsafe {
-                    if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 {
-                        libc::ioctl(master_fd, libc::TIOCSWINSZ, &ws);
-                    }
-                }
-            }
-        } else {
-            unsafe {
-                libc::kill(child_raw, sig);
-            }
+        unsafe {
+            libc::kill(child_raw, sig);
         }
-    } else if matches!(
-        sig,
-        libc::SIGINT | libc::SIGTERM | libc::SIGHUP | libc::SIGQUIT
-    ) {
+    } else if matches!(sig, libc::SIGTERM | libc::SIGHUP) {
         // No child to forward to (e.g. during the post-exit profile-save prompt).
         // For termination signals, restore the default handler and re-raise so
-        // the signal takes its default action (terminating nono) rather than
-        // being swallowed. SIGWINCH is ignored here because its PTY forwarding
-        // target is already torn down.
+        // the signal takes its default action rather than being swallowed.
         unsafe {
             libc::signal(sig, libc::SIG_DFL);
             libc::raise(sig);
@@ -2159,149 +2005,26 @@ extern "C" fn forward_signal(sig: libc::c_int) {
 
 fn clear_signal_forwarding_target() {
     CHILD_PID.store(0, std::sync::atomic::Ordering::SeqCst);
-    PTY_MASTER_FD.store(-1, std::sync::atomic::Ordering::SeqCst);
 }
 
-fn handle_pty_poll_events(
-    pty: &mut crate::pty_proxy::PtyProxy,
-    master_revents: libc::c_short,
-    client_revents: libc::c_short,
-    loop_name: &str,
-) -> bool {
-    if master_revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
-        && !pty.proxy_master_to_client()
-    {
-        debug!("Stopping {loop_name} after PTY master relay failure");
-        return false;
-    }
-    if client_revents & libc::POLLIN != 0 && !pty.proxy_client_to_master() {
-        debug!("Stopping {loop_name} after PTY client relay failure");
-        return false;
-    }
-    true
+struct SignalForwardingGuard {
+    previous_handlers: Vec<(Signal, signal::SigHandler)>,
 }
 
-/// Send `sig` to the PTY's foreground process group, falling back to `child`.
-///
-/// A shell (bash) running a foreground job (vim) puts that job in its own
-/// process group and makes it the PTY's foreground PG. Job-control signals must
-/// reach that whole group, not just the immediate child, so we query it via
-/// tcgetpgrp on the master fd and signal the negated PGID. On any error we fall
-/// back to the bare child.
-fn signal_pty_foreground_group(pty: &crate::pty_proxy::PtyProxy, child: Pid, sig: Signal) {
-    match nix::unistd::tcgetpgrp(pty.master_fd()) {
-        Ok(pgid) => {
-            let _ = signal::kill(Pid::from_raw(-pgid.as_raw()), sig);
-        }
-        Err(_) => {
-            let _ = signal::kill(child, sig);
-        }
-    }
-}
-
-/// Handle a Ctrl-Z suspension request intercepted by the PtyProxy.
-///
-/// The handling depends on whether the PTY foreground group is nono's direct
-/// child. A nested job (e.g. vim under `bash -i`) is NOT orphaned — its parent
-/// shell is in the same session — so the kernel delivers normal job-control
-/// signals: we forward a plain SIGTSTP and let the inner shell suspend/resume
-/// it. The direct child is orphaned (setsid() put it in a new session whose
-/// parent, nono, is elsewhere), so the kernel drops SIGTSTP and we must drive
-/// suspension manually: SIGSTOP, restore the terminal, raise(SIGTSTP) on nono
-/// itself, then SIGCONT on resume.
-fn handle_pty_suspension(pty: Option<&mut crate::pty_proxy::PtyProxy>, child: Pid) {
-    let pty = match pty {
-        Some(p) => p,
-        None => return,
-    };
-
-    if !pty.take_suspension_request() {
-        return;
-    }
-
-    let fg_pgid = nix::unistd::tcgetpgrp(pty.master_fd()).ok();
-    let child_is_foreground = match fg_pgid {
-        Some(pgid) => pgid.as_raw() == child.as_raw(),
-        None => true,
-    };
-
-    // Nested job: forward SIGTSTP and let the inner shell handle it. Do not
-    // waitpid() — the stopped job is not our child, and the inner shell is
-    // already blocked waiting on it, so waiting here would hang.
-    if !child_is_foreground {
-        if let Some(pgid) = fg_pgid {
-            let _ = signal::kill(Pid::from_raw(-pgid.as_raw()), Signal::SIGTSTP);
-        }
-        return;
-    }
-
-    // Direct child (orphaned PG): SIGSTOP is uncatchable, unlike SIGTSTP which
-    // an interactive bash ignores, so it forces the stopped state immediately.
-    signal_pty_foreground_group(pty, child, Signal::SIGSTOP);
-
-    loop {
-        match waitpid(child, Some(WaitPidFlag::WUNTRACED)) {
-            Ok(WaitStatus::Stopped(_, sig)) => {
-                debug!("Child stopped by signal {:?} for suspension", sig);
-                break;
+impl SignalForwardingGuard {
+    fn restore(&mut self) {
+        clear_signal_forwarding_target();
+        for (sig, handler) in self.previous_handlers.drain(..).rev() {
+            if let Err(e) = unsafe { signal::signal(sig, handler) } {
+                debug!("Failed to restore handler for {:?}: {}", sig, e);
             }
-            Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) => {
-                return;
-            }
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(_) => return,
-            _ => {}
         }
     }
-
-    // Save raw settings for restore-on-resume and preserve the cooked settings
-    // consumed by restore_terminal().
-    let raw_termios = nix::sys::termios::tcgetattr(std::io::stdin()).ok();
-    let cooked_termios = pty.saved_termios.clone();
-
-    // Exit the alternate screen so the shell's "[1]+ Stopped" prompt shows on
-    // the normal screen, then restore cooked mode.
-    pty.leave_screen_for_suspension();
-    pty.restore_terminal();
-
-    // Stop nono itself. The shell shows "[1]+  Stopped   nono run ..."
-    // When user types 'fg', the shell sends SIGCONT and we resume here.
-    unsafe {
-        let _ = signal::signal(Signal::SIGTSTP, signal::SigHandler::SigDfl);
-    }
-    let _ = signal::raise(Signal::SIGTSTP);
-
-    // --- Resumed by SIGCONT from fg ---
-
-    // Restore raw mode for PTY I/O.
-    if let Some(termios) = raw_termios {
-        let _ = nix::sys::termios::tcsetattr(
-            std::io::stdin(),
-            nix::sys::termios::SetArg::TCSANOW,
-            &termios,
-        );
-    }
-    // Restore the cooked settings for the next suspension or final teardown.
-    pty.saved_termios = cooked_termios;
-
-    // Re-enter the alternate screen the child was using before resuming it.
-    pty.reenter_screen_for_resume();
-
-    signal_pty_foreground_group(pty, child, Signal::SIGCONT);
-
-    // SIGSTOP doesn't give the child a chance to clean up its terminal state.
-    // When resumed, TUI apps (opencode, vim, htop) don't know they need to
-    // redraw because they missed the TSTP/CONT cycle they normally rely on.
-    // Sending SIGWINCH to the foreground group triggers a full redraw in both
-    // the shell and any nested TUI.
-    signal_pty_foreground_group(pty, child, Signal::SIGWINCH);
 }
-
-struct SignalForwardingGuard;
 
 impl Drop for SignalForwardingGuard {
     fn drop(&mut self) {
-        clear_signal_forwarding_target();
+        self.restore();
     }
 }
 /// Get the current thread count for the process.
@@ -2365,17 +2088,15 @@ fn get_thread_count() -> Result<usize> {
 
 /// Supervisor IPC event loop (non-Linux).
 ///
-/// Polls the supervisor socket, URL listener, and PTY relay fds for activity.
+/// Polls the supervisor socket and URL listener for activity.
 /// Uses `poll(2)` with a 200ms timeout to periodically check child status.
 /// Returns the child's wait status and any denial records collected.
 #[cfg(not(target_os = "linux"))]
-#[allow(clippy::too_many_arguments)]
 fn run_supervisor_loop(
     child: Pid,
     sock: &mut SupervisorSocket,
     config: &SupervisorConfig<'_>,
     mut trust_interceptor: Option<crate::trust_intercept::TrustInterceptor>,
-    mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
     url_listener: Option<&SupervisorListener>,
 ) -> Result<(WaitStatus, Vec<DenialRecord>, Vec<UrlDenialRecord>)> {
     // Start the macOS tool-sandbox background listener thread (no-op if tool-sandbox not active).
@@ -2397,20 +2118,9 @@ fn run_supervisor_loop(
         seen_request_ids: HashSet::new(),
     };
     loop {
-        let (pty_master, pty_client) = pty.as_ref().map_or((-1, -1), |p| p.poll_fds());
         let mut pfds = [
             libc::pollfd {
                 fd: sock_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: pty_master,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: pty_client,
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -2421,14 +2131,14 @@ fn run_supervisor_loop(
             },
         ];
 
-        let nfds: libc::nfds_t = if listener_fd >= 0 { 4 } else { 3 };
+        let nfds: libc::nfds_t = if listener_fd >= 0 { 2 } else { 1 };
         let ret = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, 200) };
 
         if ret > 0 {
             // When the child closes its end of the direct IPC socket (common for
             // programs that close inherited fds > 2), stop polling it but keep the
-            // supervisor loop alive — the URL listener and PTY relay must continue
-            // servicing requests until the child actually exits.
+            // supervisor loop alive so the URL listener can continue servicing
+            // requests until the child actually exits.
             if pfds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
                 debug!("Supervisor socket closed by child, disabling direct IPC polling");
                 sock_fd = -1;
@@ -2456,16 +2166,10 @@ fn run_supervisor_loop(
 
             // Handle URL open connections via named socket listener
             if listener_fd >= 0
-                && pfds[3].revents & libc::POLLIN != 0
+                && pfds[1].revents & libc::POLLIN != 0
                 && let Some(listener) = url_listener
             {
                 handle_url_listener_connection(listener, config, &mut denials.url);
-            }
-
-            if let Some(ref mut p) = pty
-                && !handle_pty_poll_events(p, pfds[1].revents, pfds[2].revents, "supervisor loop")
-            {
-                break;
             }
         } else if ret < 0 {
             let err = std::io::Error::last_os_error();
@@ -2474,8 +2178,6 @@ fn run_supervisor_loop(
                 break;
             }
         }
-
-        handle_pty_suspension(pty.as_deref_mut(), child);
 
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => continue,
@@ -2550,16 +2252,7 @@ fn reap_reparented_orphans(child: Pid) -> Option<WaitStatus> {
 /// - seccomp notify fd (openat/openat2 interceptions from the child)
 /// - supervisor socket (explicit capability requests from SDK clients)
 /// - URL listener socket (named socket for URL open requests from helpers)
-/// - PTY relay (real terminal <-> PTY master), when present
 /// - child process exit via non-blocking `waitpid()`
-///
-/// When a seccomp notification requires interactive approval, the relay is
-/// paused (terminal restored to canonical mode) so the user can type a response.
-/// After the prompt, raw mode is re-entered and relay resumes.
-///
-/// The relay is optional: when `capability_elevation` is off, no PTY is
-/// allocated but the supervisor loop still runs for trust interception over
-/// the IPC socket.
 ///
 /// Returns the child's wait status and any denial records collected.
 #[cfg(target_os = "linux")]
@@ -2572,7 +2265,6 @@ fn run_supervisor_loop(
     proxy_seccomp_fd: Option<&OwnedFd>,
     initial_caps: &[supervisor_linux::InitialCapability],
     mut trust_interceptor: Option<crate::trust_intercept::TrustInterceptor>,
-    mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
     url_listener: Option<&SupervisorListener>,
 ) -> Result<SupervisorLoopResult> {
     struct LoopTimer {
@@ -2670,19 +2362,6 @@ fn run_supervisor_loop(
             });
             idx
         });
-        let pty_base_idx = pfds.len();
-        let (pty_master, pty_client) = pty.as_ref().map_or((-1, -1), |p| p.poll_fds());
-        pfds.push(libc::pollfd {
-            fd: pty_master,
-            events: libc::POLLIN,
-            revents: 0,
-        });
-        pfds.push(libc::pollfd {
-            fd: pty_client,
-            events: libc::POLLIN,
-            revents: 0,
-        });
-
         let ret = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 200) };
 
         match ret.cmp(&0) {
@@ -2692,10 +2371,9 @@ fn run_supervisor_loop(
                         || proxy_notify_raw_fd.is_some()
                         || listener_raw_fd.is_some()
                         || tool_sandbox_listener_fd.is_some()
-                        || pty.is_some()
                     {
                         debug!(
-                            "Supervisor socket closed, continuing for seccomp/proxy/PTY/URL/tool-sandbox listener"
+                            "Supervisor socket closed, continuing for seccomp/proxy/URL/tool-sandbox listener"
                         );
                         sock_fd_active = false;
                         loop_timer.sock_inactive_at.get_or_insert(Instant::now());
@@ -2724,7 +2402,6 @@ fn run_supervisor_loop(
                                 && proxy_notify_raw_fd.is_none()
                                 && tool_sandbox_listener_fd.is_none()
                                 && listener_raw_fd.is_none()
-                                && pty.is_none()
                             {
                                 break;
                             }
@@ -2797,17 +2474,6 @@ fn run_supervisor_loop(
                 {
                     debug!("Error handling tool-sandbox URL request: {}", e);
                 }
-
-                if let Some(ref mut p) = pty
-                    && !handle_pty_poll_events(
-                        p,
-                        pfds[pty_base_idx].revents,
-                        pfds[pty_base_idx + 1].revents,
-                        "supervisor loop",
-                    )
-                {
-                    break;
-                }
             }
             std::cmp::Ordering::Less => {
                 let err = std::io::Error::last_os_error();
@@ -2818,8 +2484,6 @@ fn run_supervisor_loop(
             }
             std::cmp::Ordering::Equal => {}
         }
-
-        handle_pty_suspension(pty.as_deref_mut(), child);
 
         // Drain reparented orphans; if the primary child was among them,
         // surface its status directly.
@@ -4129,6 +3793,19 @@ mod tests {
     }
 
     #[test]
+    fn only_out_of_band_management_signals_are_forwarded() {
+        assert_eq!(
+            FORWARDED_MANAGEMENT_SIGNALS,
+            [Signal::SIGTERM, Signal::SIGHUP]
+        );
+        assert!(!FORWARDED_MANAGEMENT_SIGNALS.contains(&Signal::SIGINT));
+        assert!(!FORWARDED_MANAGEMENT_SIGNALS.contains(&Signal::SIGQUIT));
+        assert!(!FORWARDED_MANAGEMENT_SIGNALS.contains(&Signal::SIGTSTP));
+        assert!(!FORWARDED_MANAGEMENT_SIGNALS.contains(&Signal::SIGCONT));
+        assert!(!FORWARDED_MANAGEMENT_SIGNALS.contains(&Signal::SIGWINCH));
+    }
+
+    #[test]
     fn push_set_vars_appends_new_keys() {
         let mut env_c = vec![CString::new("HOME=/home/x").expect("cstring")];
         let set_vars = vec![("RUST_LOG".to_string(), "debug".to_string())];
@@ -4757,14 +4434,14 @@ mod tests {
         assert_eq!(path.ok(), Some(PathBuf::from("/proc/1000/maps")));
     }
 
-    /// Verify that the supervisor loop runs and exits cleanly without a PTY relay.
+    /// Verify that the supervisor loop runs and exits cleanly with inherited stdio.
     ///
     /// This tests the `capability_elevation = false` code path where no PTY is
     /// allocated but the supervisor loop must still service the IPC socket for
     /// trust interception. The child fork closes its socket end and exits,
     /// causing the loop to see POLLHUP and return.
     #[test]
-    fn test_supervisor_loop_runs_without_pty_relay() {
+    fn test_supervisor_loop_runs_with_inherited_stdio() {
         use std::os::unix::net::UnixStream;
 
         struct DenyAll;
@@ -4828,8 +4505,8 @@ mod tests {
                 drop(child_stream);
                 let mut sock = SupervisorSocket::from_stream(parent_stream);
 
-                // Run supervisor loop with relay: None (the capability_elevation=false path).
-                // It should poll the socket, see POLLHUP when child exits, and return.
+                // The loop should poll the socket, see POLLHUP when the child exits,
+                // and return without any stdio relay.
                 #[cfg(target_os = "linux")]
                 let result = run_supervisor_loop(
                     child,
@@ -4839,16 +4516,13 @@ mod tests {
                     None, // no proxy seccomp
                     &[],  // no initial caps
                     None, // no trust interceptor
-                    None, // no PTY relay — this is what we're testing
                     None, // no URL listener
                 );
 
                 #[cfg(not(target_os = "linux"))]
                 let result = run_supervisor_loop(
                     child, &mut sock, &sup_cfg, None, // no trust interceptor
-                    None, // no PTY relay
                     None, // no URL listener
-                    &mut false,
                 );
 
                 #[cfg(target_os = "linux")]
@@ -4960,7 +4634,6 @@ mod tests {
                     None, // no proxy seccomp — V4+ Landlock handles it
                     &[],  // no initial caps
                     None, // no trust interceptor
-                    None, // no PTY relay
                     None, // no URL listener
                 );
 

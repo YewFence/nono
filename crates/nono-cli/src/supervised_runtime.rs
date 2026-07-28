@@ -7,20 +7,16 @@ use crate::rollback_runtime::{
     AuditState, FinalizeOutcome, RollbackExitContext, create_audit_state, finalize_supervised_exit,
     initialize_audit_snapshots, initialize_rollback_state, warn_if_rollback_flags_ignored,
 };
-use crate::{
-    approval_runtime, exec_strategy, output, protected_paths, pty_proxy, session, trust_intercept,
-};
+use crate::{approval_runtime, exec_strategy, output, protected_paths, session, trust_intercept};
 use colored::Colorize;
 use nono::undo::ExecutableIdentity;
 use nono::{CapabilitySet, Result};
-use std::io::IsTerminal;
 use std::sync::{Arc, Mutex};
 
 struct SessionRuntimeState {
     started: String,
     short_session_id: String,
     session_guard: Option<session::SessionGuard>,
-    pty_pair: Option<pty_proxy::PtyPair>,
 }
 
 pub(crate) struct SupervisedRuntimeContext<'a> {
@@ -117,21 +113,11 @@ fn create_session_runtime_state(
         rollback_session: audit_state.map(|state| state.session_id.clone()),
     };
     let session_guard = Some(session::SessionGuard::new(session_record)?);
-    let pty_pair = if should_open_supervised_pty(
-        std::io::stdin().is_terminal(),
-        std::io::stdout().is_terminal(),
-        std::io::stderr().is_terminal(),
-    ) {
-        Some(pty_proxy::open_pty()?)
-    } else {
-        None
-    };
 
     Ok(SessionRuntimeState {
         started,
         short_session_id,
         session_guard,
-        pty_pair,
     })
 }
 
@@ -183,14 +169,6 @@ const fn is_ordinary_failure_exit(exit_code: i32) -> bool {
     exit_code > 0 && exit_code <= 128
 }
 
-fn should_open_supervised_pty(
-    stdin_is_terminal: bool,
-    stdout_is_terminal: bool,
-    stderr_is_terminal: bool,
-) -> bool {
-    stdin_is_terminal && stdout_is_terminal && stderr_is_terminal
-}
-
 pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> Result<i32> {
     let SupervisedRuntimeContext {
         config,
@@ -217,8 +195,8 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     )?;
     warn_if_rollback_flags_ignored(rollback, silent);
 
-    // Create the session guard and PTY pair before rollback initialization so
-    // session management can observe long-running baseline snapshots.
+    // Create the session guard before rollback initialization so session
+    // management can observe long-running baseline snapshots.
     let trust_interceptor = create_trust_interceptor(trust);
     let session_runtime = create_session_runtime_state(
         command,
@@ -231,7 +209,6 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         started,
         short_session_id,
         mut session_guard,
-        pty_pair,
     } = session_runtime;
 
     let audit_tracked_paths = crate::rollback_runtime::derive_audit_tracked_paths(caps);
@@ -406,7 +383,6 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
             Some(&supervisor_cfg),
             trust_interceptor,
             Some(&mut on_fork),
-            pty_pair,
             Some(&short_session_id),
             resource_procs_fd,
             on_exit_diag,
@@ -468,8 +444,6 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::should_open_supervised_pty;
-
     /// A finalize failure is nono's own, so it may not overwrite what the child
     /// reported: only a clean run is downgraded, which is the one case where the
     /// substituted status cannot be mistaken for the command's own.
@@ -481,7 +455,6 @@ mod tests {
         assert_eq!(exit_code_after_finalization_failure(7), 7);
         assert_eq!(exit_code_after_finalization_failure(137), 137);
     }
-
     /// Off-Linux, a requested memory limit is refused with UnsupportedPlatform (not
     /// SandboxInit), so it maps to the right diagnostic/exit and reads naturally.
     /// Pinned on every host so the variant can't silently regress, even though the
@@ -544,13 +517,5 @@ mod tests {
             !is_ordinary_failure_exit(143),
             "SIGTERM (128+15) is a kill, not a fork failure"
         );
-    }
-
-    #[test]
-    fn supervised_pty_is_used_for_terminal_stdio() {
-        assert!(should_open_supervised_pty(true, true, true));
-        assert!(!should_open_supervised_pty(false, true, true));
-        assert!(!should_open_supervised_pty(true, false, true));
-        assert!(!should_open_supervised_pty(true, true, false));
     }
 }
