@@ -914,6 +914,7 @@ fn run_child_launcher() -> Result<()> {
     tool_sandbox_profile_log!("launcher:caps_from_spec: {:?}", start_caps_from.elapsed());
     let start_sandbox_apply = std::time::Instant::now();
     Sandbox::apply_seccomp(&caps, nono::SeccompOpts::network_baseline())?;
+    nono::sandbox::install_seccomp_tiocsti_filter()?;
     tool_sandbox_profile_log!(
         "launcher:sandbox_apply: {:?}",
         start_sandbox_apply.elapsed()

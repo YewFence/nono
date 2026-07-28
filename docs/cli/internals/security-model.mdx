@@ -242,7 +242,9 @@ Once injected, the child holds the fd until it closes it. There is no revocation
 
 ## Syscall Scope
 
-The seccomp filter traps only `openat` and `openat2`. All other syscalls pass through at full speed with zero overhead.
+The capability-expansion seccomp filter traps only `openat` and `openat2`. Linux sandboxed children also receive a small fail-closed filter that rejects `ioctl(TIOCSTI)` with `EPERM`, preventing them from injecting bytes into a shared terminal input queue. Other ioctl requests continue to the kernel unchanged.
+
+Some Linux hosts additionally disable `TIOCSTI` through a sysctl. That host setting is useful defense in depth, but nono does not depend on it: the per-child seccomp filter is installed before every top-level or tool-sandbox child exec, and installation failure aborts the child.
 
 | Syscall | Trapped | Rationale |
 |---------|---------|-----------|

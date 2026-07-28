@@ -1525,6 +1525,7 @@ const BPF_K: u16 = 0x00;
 const BPF_RET: u16 = 0x06;
 
 const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
 const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 
@@ -1535,7 +1536,6 @@ const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 const NATIVE_AUDIT_ARCH: u32 = 0xc000_003e;
 #[cfg(target_arch = "aarch64")]
 const NATIVE_AUDIT_ARCH: u32 = 0xc000_00b7;
-
 // Syscall numbers for x86_64 (public for CLI to distinguish openat vs openat2)
 #[cfg(target_arch = "x86_64")]
 pub const SYS_OPENAT: i32 = 257;
@@ -1554,6 +1554,8 @@ const SYS_SOCKET: i32 = libc::SYS_socket as i32;
 const SYS_SOCKETPAIR: i32 = libc::SYS_socketpair as i32;
 #[cfg(target_os = "linux")]
 const SYS_IO_URING_SETUP: i32 = libc::SYS_io_uring_setup as i32;
+#[cfg(target_os = "linux")]
+const SYS_IOCTL: i32 = libc::SYS_ioctl as i32;
 
 // Syscall numbers for connect/bind (public for CLI supervisor handler)
 #[cfg(target_os = "linux")]
@@ -1617,6 +1619,7 @@ pub fn validate_openat2_size(how_size: usize) -> bool {
 
 // Offset of `nr` field in seccomp_data (used by BPF)
 const SECCOMP_DATA_NR_OFFSET: u32 = 0;
+const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
 const SECCOMP_DATA_ARG0_OFFSET: u32 = 16;
 const SECCOMP_DATA_ARG1_OFFSET: u32 = 24;
 const SECCOMP_DATA_ARG2_OFFSET: u32 = 32;
@@ -1850,6 +1853,100 @@ pub fn install_seccomp_notify() -> Result<std::os::fd::OwnedFd> {
     // SAFETY: The fd returned by seccomp() with NEW_LISTENER is a valid,
     // newly-created file descriptor that we now own.
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(notify_fd) })
+}
+
+fn build_seccomp_tiocsti_filter() -> [SockFilterInsn; 9] {
+    let errno_ret = SECCOMP_RET_ERRNO | (libc::EPERM as u32);
+
+    [
+        SockFilterInsn {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_DATA_ARCH_OFFSET,
+        },
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 1,
+            jf: 0,
+            k: NATIVE_AUDIT_ARCH,
+        },
+        SockFilterInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_KILL_PROCESS,
+        },
+        SockFilterInsn {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_DATA_NR_OFFSET,
+        },
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 0,
+            jf: 3,
+            k: SYS_IOCTL as u32,
+        },
+        SockFilterInsn {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_DATA_ARG1_OFFSET,
+        },
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 0,
+            jf: 1,
+            k: libc::TIOCSTI as u32,
+        },
+        SockFilterInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: errno_ret,
+        },
+        SockFilterInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ALLOW,
+        },
+    ]
+}
+
+/// Install a seccomp filter that rejects terminal input queue injection.
+///
+/// # Errors
+///
+/// Returns an error if `PR_SET_NO_NEW_PRIVS` or filter installation fails.
+pub fn install_seccomp_tiocsti_filter() -> Result<()> {
+    let filter = build_seccomp_tiocsti_filter();
+    let prog = SockFprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr(),
+    };
+
+    // SAFETY: `prctl(PR_SET_NO_NEW_PRIVS)` is process-local and takes scalar arguments.
+    let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    if ret != 0 {
+        return Err(NonoError::SandboxInit(format!(
+            "prctl(PR_SET_NO_NEW_PRIVS) failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    // SAFETY: `prog` points to a valid classic BPF program for the duration of prctl.
+    let ret = unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &prog) };
+    if ret != 0 {
+        return Err(NonoError::SandboxInit(format!(
+            "seccomp TIOCSTI filter installation failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    Ok(())
 }
 
 /// Install a seccomp filter that blocks non-Unix socket creation.
@@ -4543,6 +4640,105 @@ mod tests {
             evaluate_static_bpf(&filter, libc::SYS_read as i32, [0; 6]),
             SECCOMP_RET_ALLOW
         );
+    }
+
+    #[test]
+    fn test_build_seccomp_tiocsti_filter_shape() {
+        let filter = build_seccomp_tiocsti_filter();
+
+        assert_eq!(filter.len(), 9);
+        assert_eq!(filter[0].code, BPF_LD | BPF_W | BPF_ABS);
+        assert_eq!(filter[0].k, SECCOMP_DATA_ARCH_OFFSET);
+        assert_eq!(filter[1].code, BPF_JMP | BPF_JEQ | BPF_K);
+        assert_eq!(filter[1].k, NATIVE_AUDIT_ARCH);
+        assert_eq!(filter[1].jt, 1);
+        assert_eq!(filter[2].k, SECCOMP_RET_KILL_PROCESS);
+
+        assert_eq!(filter[3].k, SECCOMP_DATA_NR_OFFSET);
+        assert_eq!(filter[4].k, SYS_IOCTL as u32);
+        assert_eq!(filter[4].jf, 3);
+        assert_eq!(filter[5].k, SECCOMP_DATA_ARG1_OFFSET);
+        assert_eq!(filter[6].k, libc::TIOCSTI as u32);
+        assert_eq!(filter[6].jf, 1);
+        assert_eq!(filter[7].k, SECCOMP_RET_ERRNO | (libc::EPERM as u32));
+        assert_eq!(filter[8].k, SECCOMP_RET_ALLOW);
+    }
+
+    #[test]
+    fn test_seccomp_tiocsti_filter_denies_only_target_request() {
+        let mut report_pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(report_pipe.as_mut_ptr()) }, 0);
+
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            unsafe {
+                libc::close(report_pipe[0]);
+            }
+            let mut payload = [0_i32; 4];
+            if install_seccomp_tiocsti_filter().is_err() {
+                payload[0] = 2;
+            } else {
+                payload[0] = unsafe {
+                    libc::ioctl(
+                        -1,
+                        libc::TIOCSTI as libc::Ioctl,
+                        std::ptr::null_mut::<libc::c_void>(),
+                    )
+                };
+                payload[1] = std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or_default();
+                payload[2] = unsafe {
+                    libc::ioctl(
+                        -1,
+                        libc::TIOCGWINSZ as libc::Ioctl,
+                        std::ptr::null_mut::<libc::c_void>(),
+                    )
+                };
+                payload[3] = std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or_default();
+            }
+
+            let bytes = std::mem::size_of_val(&payload);
+            let wrote = unsafe {
+                libc::write(
+                    report_pipe[1],
+                    payload.as_ptr().cast::<libc::c_void>(),
+                    bytes,
+                )
+            };
+            unsafe {
+                libc::close(report_pipe[1]);
+                libc::_exit(if wrote == bytes as isize { 0 } else { 3 });
+            }
+        }
+
+        unsafe {
+            libc::close(report_pipe[1]);
+        }
+        let mut payload = [0_i32; 4];
+        let bytes = std::mem::size_of_val(&payload);
+        let read = unsafe {
+            libc::read(
+                report_pipe[0],
+                payload.as_mut_ptr().cast::<libc::c_void>(),
+                bytes,
+            )
+        };
+        unsafe {
+            libc::close(report_pipe[0]);
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert_eq!(read, bytes as isize);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        assert_eq!(payload[0], -1);
+        assert_eq!(payload[1], libc::EPERM);
+        assert_eq!(payload[2], -1);
+        assert_eq!(payload[3], libc::EBADF);
     }
 
     #[test]

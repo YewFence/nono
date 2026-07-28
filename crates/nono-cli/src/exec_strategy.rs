@@ -1244,6 +1244,19 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     child_keep_fds.push(pnf.as_raw_fd());
                 }
 
+                if let Err(e) = nono::sandbox::install_seccomp_tiocsti_filter() {
+                    let detail = format!("nono: failed to install TIOCSTI filter: {e}\n");
+                    let msg = detail.as_bytes();
+                    unsafe {
+                        libc::write(
+                            libc::STDERR_FILENO,
+                            msg.as_ptr().cast::<libc::c_void>(),
+                            msg.len(),
+                        );
+                        libc::_exit(126);
+                    }
+                }
+
                 if !config.seccomp_policy.child_requires_dumpable() {
                     use nix::sys::prctl;
 
