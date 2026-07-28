@@ -1,7 +1,7 @@
 use crate::command_policy::{
     ApprovalBackendConfig, ApprovalBackendType, ApprovalChainMode, CommandPoliciesConfig,
+    REMOVED_TERMINAL_APPROVAL_MESSAGE,
 };
-use crate::terminal_approval::TerminalApproval;
 use nono::{ApprovalBackend, ApprovalDecision, ApprovalRequest, NonoError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -37,6 +37,21 @@ pub(crate) fn build_approval_registry(
     ))
 }
 
+pub(crate) fn build_supervisor_approval_backend(
+    config: Option<&CommandPoliciesConfig>,
+) -> Result<Arc<dyn ApprovalBackend>> {
+    let Some(config) = config else {
+        return Ok(Arc::new(UnconfiguredApproval));
+    };
+    if config.approval_defaults.backend.is_none() {
+        return Ok(Arc::new(UnconfiguredApproval));
+    }
+
+    let registry = build_approval_registry(config)?;
+    let (_, backend) = registry.resolve(None)?;
+    Ok(backend)
+}
+
 fn build_approval_backends(
     config: &CommandPoliciesConfig,
 ) -> Result<BTreeMap<String, Arc<dyn ApprovalBackend>>> {
@@ -68,9 +83,11 @@ fn build_approval_backend(
         .get(name)
         .ok_or_else(|| NonoError::ConfigParse(format!("unknown approval backend '{name}'")))?;
     let backend: Arc<dyn ApprovalBackend> = match backend_config.backend_type {
-        ApprovalBackendType::Terminal => Arc::new(NamedTerminalApproval {
-            name: name.to_string(),
-        }),
+        ApprovalBackendType::Terminal => {
+            return Err(NonoError::ConfigParse(format!(
+                "approval backend '{name}' uses removed type terminal; {REMOVED_TERMINAL_APPROVAL_MESSAGE}"
+            )));
+        }
         ApprovalBackendType::Webhook => Arc::new(WebhookApproval::new(name, backend_config)?),
         ApprovalBackendType::Chain => {
             let mode = backend_config.mode.ok_or_else(|| {
@@ -93,17 +110,17 @@ fn build_approval_backend(
     Ok(backend)
 }
 
-struct NamedTerminalApproval {
-    name: String,
-}
+struct UnconfiguredApproval;
 
-impl ApprovalBackend for NamedTerminalApproval {
-    fn request_approval(&self, request: &ApprovalRequest) -> Result<ApprovalDecision> {
-        TerminalApproval.request_approval(request)
+impl ApprovalBackend for UnconfiguredApproval {
+    fn request_approval(&self, _request: &ApprovalRequest) -> Result<ApprovalDecision> {
+        Ok(ApprovalDecision::Denied {
+            reason: "command_policies.approval_defaults.backend is not configured".to_string(),
+        })
     }
 
     fn backend_name(&self) -> &str {
-        &self.name
+        "unconfigured"
     }
 }
 
@@ -171,7 +188,9 @@ impl WebhookApproval {
                     }),
                 })
             }
-            "timeout" | "timed_out" => Ok(ApprovalDecision::Timeout),
+            "timeout" | "timed_out" => Ok(ApprovalDecision::Denied {
+                reason: format!("approval webhook '{}' timed out", self.name),
+            }),
             other => Err(NonoError::SandboxInit(format!(
                 "approval webhook '{}' returned unknown decision '{other}'",
                 self.name
@@ -260,6 +279,11 @@ impl ApprovalBackend for ChainApproval {
 
 impl ChainApproval {
     fn request_all(&self, request: &ApprovalRequest) -> Result<ApprovalDecision> {
+        if self.backends.is_empty() {
+            return Ok(ApprovalDecision::Denied {
+                reason: format!("{} had no granting backend", self.name),
+            });
+        }
         for backend in &self.backends {
             match backend.request_approval(request)? {
                 ApprovalDecision::Granted => {}
@@ -343,6 +367,69 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_without_default_backend_denies_capability_expansion() {
+        let backend = build_supervisor_approval_backend(None).unwrap();
+
+        let decision = backend.request_approval(&request()).unwrap();
+
+        assert_eq!(backend.backend_name(), "unconfigured");
+        let ApprovalDecision::Denied { reason } = decision else {
+            panic!("unconfigured backend must deny requests");
+        };
+        assert_eq!(
+            reason,
+            "command_policies.approval_defaults.backend is not configured"
+        );
+    }
+
+    #[test]
+    fn runtime_builder_rejects_removed_terminal_backend() {
+        let mut config = CommandPoliciesConfig::default();
+        config.approval_defaults.backend = Some("human".to_string());
+        config.approval_backends.insert(
+            "human".to_string(),
+            ApprovalBackendConfig {
+                backend_type: ApprovalBackendType::Terminal,
+                url: None,
+                timeout_secs: None,
+                mode: None,
+                backends: Vec::new(),
+            },
+        );
+
+        let Err(error) = build_supervisor_approval_backend(Some(&config)) else {
+            panic!("terminal backend must be rejected");
+        };
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Configuration parse error: approval backend 'human' uses removed type terminal; {REMOVED_TERMINAL_APPROVAL_MESSAGE}"
+            )
+        );
+    }
+
+    #[test]
+    fn supervisor_uses_configured_default_backend() {
+        let mut config = CommandPoliciesConfig::default();
+        config.approval_defaults.backend = Some("security-review".to_string());
+        config.approval_backends.insert(
+            "security-review".to_string(),
+            ApprovalBackendConfig {
+                backend_type: ApprovalBackendType::Webhook,
+                url: Some("https://approvals.example/review".to_string()),
+                timeout_secs: Some(1),
+                mode: None,
+                backends: Vec::new(),
+            },
+        );
+
+        let backend = build_supervisor_approval_backend(Some(&config)).unwrap();
+
+        assert_eq!(backend.backend_name(), "security-review");
+    }
+
+    #[test]
     fn chain_all_requires_every_backend_to_grant() {
         let chain = ChainApproval {
             name: "all".to_string(),
@@ -359,6 +446,17 @@ mod tests {
                     },
                 }),
             ],
+        };
+
+        assert!(chain.request_approval(&request()).unwrap().is_denied());
+    }
+
+    #[test]
+    fn empty_chain_all_denies_instead_of_granting() {
+        let chain = ChainApproval {
+            name: "all".to_string(),
+            mode: ApprovalChainMode::All,
+            backends: Vec::new(),
         };
 
         assert!(chain.request_approval(&request()).unwrap().is_denied());
@@ -407,5 +505,10 @@ mod tests {
                 .unwrap()
                 .is_denied()
         );
+        let timeout = backend.parse_response(r#"{"decision":"timeout"}"#).unwrap();
+        let ApprovalDecision::Denied { reason } = timeout else {
+            panic!("webhook timeout must fail closed as a denial");
+        };
+        assert_eq!(reason, "approval webhook 'security-review' timed out");
     }
 }

@@ -44,7 +44,7 @@ pub(crate) fn notify_startup_termination_for_child(
 ) {
     if let Some(proxy) = pty {
         // Restore the terminal from raw mode so the message renders cleanly.
-        proxy.pause_terminal_for_prompt();
+        proxy.release_terminal_for_startup_diagnostic();
         notify_startup_termination(timeout_cfg, has_output);
         return;
     }

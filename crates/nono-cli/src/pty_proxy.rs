@@ -485,11 +485,8 @@ impl PtyProxy {
         std::mem::take(&mut self.suspension_requested)
     }
 
-    /// Temporarily restore the local terminal so the parent can prompt.
-    ///
-    /// Returns true when the foreground terminal was paused and must later
-    /// be resumed with [`Self::resume_terminal_after_prompt`].
-    pub fn pause_terminal_for_prompt(&mut self) -> bool {
+    /// Restore the local terminal before printing a startup diagnostic.
+    pub fn release_terminal_for_startup_diagnostic(&mut self) -> bool {
         if self.terminal_active {
             leave_child_screen(self.screen.alternate_screen_active());
             self.restore_terminal();
@@ -497,21 +494,6 @@ impl PtyProxy {
         } else {
             false
         }
-    }
-
-    /// Re-enter relay terminal mode after a supervisor-owned prompt.
-    ///
-    /// Returns true when the foreground terminal was resumed.
-    pub fn resume_terminal_after_prompt(&mut self) -> bool {
-        if !self.terminal_active {
-            return false;
-        }
-
-        if self.saved_termios.is_none() {
-            self.saved_termios = set_terminal_raw();
-        }
-        self.reenter_screen_for_resume();
-        true
     }
 
     /// Restore terminal settings.

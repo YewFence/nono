@@ -1746,7 +1746,7 @@
         "type": {
           "type": "string",
           "enum": ["terminal", "webhook", "chain"],
-          "description": "Approval backend kind."
+          "description": "Approval backend kind. The terminal value is accepted only so validation can report its removal; configure webhook or chain."
         },
         "url": {
           "type": "string",

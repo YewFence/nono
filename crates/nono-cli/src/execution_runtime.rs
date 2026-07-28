@@ -667,6 +667,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         ));
     }
 
+    let command_policies = flags.command_policies.as_ref();
     let config = exec_strategy::ExecConfig {
         command: &command,
         resolved_program: &exec_resolved_program,
@@ -741,6 +742,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 proxy_handle: proxy_handle.as_ref(),
                 executable_identity: executable_identity.as_ref(),
                 audit_signer: audit_signer.as_ref(),
+                command_policies,
                 redaction_policy: &flags.redaction_policy,
                 silent: flags.silent,
             });

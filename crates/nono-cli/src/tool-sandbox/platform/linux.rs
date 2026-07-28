@@ -6038,9 +6038,10 @@ mod tests {
             queued_requests: AtomicUsize::new(0),
             emitted_error_response: AtomicBool::new(false),
             token_broker: crate::tool_sandbox::token_broker::new_shared_broker(),
-            approval_backends: nono_proxy::approval::ApprovalBackendRegistry::singleton(Arc::new(
-                crate::terminal_approval::TerminalApproval,
-            )),
+            approval_backends: nono_proxy::approval::ApprovalBackendRegistry::new(
+                None,
+                BTreeMap::new(),
+            ),
         }
     }
 

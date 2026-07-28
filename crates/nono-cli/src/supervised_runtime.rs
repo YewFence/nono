@@ -8,7 +8,7 @@ use crate::rollback_runtime::{
     initialize_audit_snapshots, initialize_rollback_state, warn_if_rollback_flags_ignored,
 };
 use crate::{
-    exec_strategy, output, protected_paths, pty_proxy, session, terminal_approval, trust_intercept,
+    approval_runtime, exec_strategy, output, protected_paths, pty_proxy, session, trust_intercept,
 };
 use colored::Colorize;
 use nono::undo::ExecutableIdentity;
@@ -34,6 +34,7 @@ pub(crate) struct SupervisedRuntimeContext<'a> {
     pub(crate) proxy_handle: Option<&'a nono_proxy::server::ProxyHandle>,
     pub(crate) executable_identity: Option<&'a ExecutableIdentity>,
     pub(crate) audit_signer: Option<&'a AuditSigner>,
+    pub(crate) command_policies: Option<&'a crate::command_policy::CommandPoliciesConfig>,
     pub(crate) redaction_policy: &'a nono::ScrubPolicy,
     pub(crate) silent: bool,
 }
@@ -202,6 +203,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         proxy_handle,
         executable_identity,
         audit_signer,
+        command_policies,
         redaction_policy,
         silent,
     } = ctx;
@@ -276,11 +278,11 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     }
 
     let protected_roots = protected_paths::ProtectedRoots::from_defaults()?;
-    let approval_backend = terminal_approval::TerminalApproval;
+    let approval_backend = approval_runtime::build_supervisor_approval_backend(command_policies)?;
     let supervisor_session_id = build_supervisor_session_id(audit_state.as_ref());
     let supervisor_cfg = exec_strategy::SupervisorConfig {
         protected_roots: protected_roots.as_paths(),
-        approval_backend: &approval_backend,
+        approval_backend: approval_backend.as_ref(),
         session_id: &supervisor_session_id,
         open_url_origins: proxy
             .and_then(|p| p.open_url.as_ref())

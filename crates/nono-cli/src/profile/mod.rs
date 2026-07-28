@@ -8645,7 +8645,8 @@ mod tests {
             "command_policies": {
                 "approval_backends": {
                     "human": {
-                        "type": "terminal"
+                        "type": "webhook",
+                        "url": "https://approvals.example/review"
                     }
                 },
                 "approval_defaults": {

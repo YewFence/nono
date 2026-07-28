@@ -82,7 +82,6 @@ pub(super) struct SeccompNotificationState<'a> {
     pub(super) rate_limiter: &'a mut RateLimiter,
     pub(super) denials: &'a mut Vec<DenialRecord>,
     pub(super) trust_interceptor: Option<&'a mut TrustInterceptor>,
-    pub(super) pty: Option<&'a mut crate::pty_proxy::PtyProxy>,
 }
 
 /// Read the TGID (thread group ID / process ID) of a thread from /proc/<tid>/status.
@@ -197,7 +196,6 @@ pub(super) fn handle_seccomp_notification(
         rate_limiter,
         denials,
         mut trust_interceptor,
-        pty,
     } = state;
 
     // 1. Receive the notification
@@ -568,7 +566,7 @@ pub(super) fn handle_seccomp_notification(
     };
     let decision_started: Instant = Instant::now();
 
-    let decision = match super::request_approval_with_relay_paused(config, &request, pty) {
+    let decision = match config.approval_backend.request_approval(&request) {
         Ok(d) => {
             if d.is_denied() {
                 record_denial(

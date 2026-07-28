@@ -382,6 +382,8 @@ pub enum ApprovalBackendType {
     Chain,
 }
 
+pub(crate) const REMOVED_TERMINAL_APPROVAL_MESSAGE: &str = "terminal approval is no longer supported because nono no longer reads the terminal while a child is running; configure a webhook or chain backend";
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalChainMode {
@@ -2118,12 +2120,12 @@ fn validate_approval_backend(
 ) {
     match backend.backend_type {
         ApprovalBackendType::Terminal => {
-            if backend.url.is_some() || backend.mode.is_some() || !backend.backends.is_empty() {
-                report.error(
-                    "invalid_approval_backend",
-                    format!("approval backend '{name}' type terminal cannot define url, mode, or backends"),
-                );
-            }
+            report.error(
+                "removed_approval_backend",
+                format!(
+                    "approval backend '{name}' uses removed type terminal; {REMOVED_TERMINAL_APPROVAL_MESSAGE}"
+                ),
+            );
         }
         ApprovalBackendType::Webhook => {
             if backend.url.as_deref().unwrap_or_default().is_empty() {
@@ -2176,6 +2178,17 @@ fn validate_approval_backend(
                         "unknown_approval_backend",
                         format!(
                             "approval backend '{name}' references unknown backend '{child_backend}'"
+                        ),
+                    );
+                } else if config
+                    .approval_backends
+                    .get(child_backend)
+                    .is_some_and(|child| child.backend_type == ApprovalBackendType::Terminal)
+                {
+                    report.error(
+                        "removed_approval_backend",
+                        format!(
+                            "approval backend '{name}' references removed terminal backend '{child_backend}'; {REMOVED_TERMINAL_APPROVAL_MESSAGE}"
                         ),
                     );
                 }
@@ -5854,8 +5867,8 @@ mod tests {
         config.approval_backends.insert(
             "human".to_string(),
             ApprovalBackendConfig {
-                backend_type: ApprovalBackendType::Terminal,
-                url: None,
+                backend_type: ApprovalBackendType::Webhook,
+                url: Some("https://approvals.example/review".to_string()),
                 timeout_secs: Some(0),
                 mode: None,
                 backends: Vec::new(),
@@ -5921,6 +5934,74 @@ mod tests {
             timeout_errors, 5,
             "expected timeout validation on defaults, backend, invocation, endpoint, and intercept"
         );
+    }
+
+    #[test]
+    fn terminal_approval_backend_is_rejected_as_removed() {
+        let mut config = active_git_config();
+        config.approval_defaults.backend = Some("human".to_string());
+        config.approval_backends.insert(
+            "human".to_string(),
+            ApprovalBackendConfig {
+                backend_type: ApprovalBackendType::Terminal,
+                url: None,
+                timeout_secs: None,
+                mode: None,
+                backends: Vec::new(),
+            },
+        );
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        let finding = report
+            .errors
+            .iter()
+            .find(|finding| finding.code == "removed_approval_backend")
+            .expect("terminal backend should produce a migration error");
+
+        assert_eq!(
+            finding.message,
+            format!(
+                "approval backend 'human' uses removed type terminal; {REMOVED_TERMINAL_APPROVAL_MESSAGE}"
+            )
+        );
+    }
+
+    #[test]
+    fn chain_referencing_terminal_backend_is_rejected() {
+        let mut config = active_git_config();
+        config.approval_backends.insert(
+            "human".to_string(),
+            ApprovalBackendConfig {
+                backend_type: ApprovalBackendType::Terminal,
+                url: None,
+                timeout_secs: None,
+                mode: None,
+                backends: Vec::new(),
+            },
+        );
+        config.approval_backends.insert(
+            "review".to_string(),
+            ApprovalBackendConfig {
+                backend_type: ApprovalBackendType::Chain,
+                url: None,
+                timeout_secs: None,
+                mode: Some(ApprovalChainMode::All),
+                backends: vec!["human".to_string()],
+            },
+        );
+        config.approval_defaults.backend = Some("review".to_string());
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(report.errors.iter().any(|finding| {
+            finding.code == "removed_approval_backend"
+                && finding.message
+                    == format!(
+                        "approval backend 'review' references removed terminal backend 'human'; {REMOVED_TERMINAL_APPROVAL_MESSAGE}"
+                    )
+        }));
     }
 
     #[test]

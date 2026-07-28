@@ -2523,7 +2523,6 @@ fn run_supervisor_loop(
                             config,
                             &mut denials,
                             trust_interceptor.as_mut(),
-                            pty.as_deref_mut(),
                         ) {
                             warn!("Error handling supervisor message: {}", e);
                         }
@@ -2814,7 +2813,6 @@ fn run_supervisor_loop(
                                 config,
                                 &mut denials,
                                 trust_interceptor.as_mut(),
-                                pty.as_deref_mut(),
                             ) {
                                 warn!("Error handling supervisor message: {}", e);
                             }
@@ -2847,7 +2845,6 @@ fn run_supervisor_loop(
                             rate_limiter: &mut rate_limiter,
                             denials: &mut denials.fs,
                             trust_interceptor: trust_interceptor.as_mut(),
-                            pty: pty.as_deref_mut(),
                         },
                     )
                 {
@@ -3040,28 +3037,6 @@ struct SupervisorDenials {
     seen_request_ids: HashSet<String>,
 }
 
-/// Run an approval request with the PTY relay paused.
-///
-/// While the foreground terminal is connected to the PTY relay, it is
-/// in raw mode and relaying keystrokes to the child, so an interactive prompt
-/// would render garbled and never see the user's answer. Pause the relay
-/// (restoring cooked mode) for the duration of the request and re-enter relay
-/// mode afterwards. A no-op after the terminal has been released.
-fn request_approval_with_relay_paused(
-    config: &SupervisorConfig<'_>,
-    request: &nono::supervisor::ApprovalRequest,
-    mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
-) -> Result<ApprovalDecision> {
-    let paused_for_prompt = pty
-        .as_mut()
-        .is_some_and(|proxy| proxy.pause_terminal_for_prompt());
-    let result = config.approval_backend.request_approval(request);
-    if paused_for_prompt && let Some(proxy) = pty.as_mut() {
-        proxy.resume_terminal_after_prompt();
-    }
-    result
-}
-
 /// Handle a single supervisor IPC message.
 ///
 /// Flow:
@@ -3078,7 +3053,6 @@ fn handle_supervisor_message(
     config: &SupervisorConfig<'_>,
     denials: &mut SupervisorDenials,
     mut trust_interceptor: Option<&mut crate::trust_intercept::TrustInterceptor>,
-    mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
 ) -> Result<()> {
     match msg {
         SupervisorMessage::Request(request) => {
@@ -3163,10 +3137,8 @@ fn handle_supervisor_message(
                         // Stash the verified digest for TOCTOU re-check at open time
                         verified_digest = Some(verified.digest);
                         // Instruction file verified — proceed to approval backend
-                        match request_approval_with_relay_paused(
-                            config,
+                        match config.approval_backend.request_approval(
                             &nono::supervisor::ApprovalRequest::from(request.clone()),
-                            pty.as_deref_mut(),
                         ) {
                             Ok(d) => {
                                 if d.is_denied() {
@@ -3219,11 +3191,10 @@ fn handle_supervisor_message(
                 }
             } else {
                 // 3. Delegate to approval backend (non-instruction files)
-                match request_approval_with_relay_paused(
-                    config,
-                    &nono::supervisor::ApprovalRequest::from(request.clone()),
-                    pty,
-                ) {
+                match config
+                    .approval_backend
+                    .request_approval(&nono::supervisor::ApprovalRequest::from(request.clone()))
+                {
                     Ok(d) => {
                         if d.is_denied() {
                             record_denial(
